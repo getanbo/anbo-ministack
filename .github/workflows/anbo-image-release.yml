@@ -60,10 +60,10 @@ jobs:
           full_digest=$(docker buildx imagetools inspect "${full_ref}" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
           for digest in "${regular_digest}" "${full_digest}"; do
-            case "${digest}" in
-              sha256:[0-9a-f][0-9a-f]*) ;;
-              *) echo "Candidate did not resolve to an immutable sha256 digest" >&2; exit 1 ;;
-            esac
+            if ! printf '%s' "${digest}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "Candidate did not resolve to an immutable sha256 digest" >&2
+              exit 1
+            fi
           done
 
           docker buildx imagetools inspect "${regular_ref}" --format '{{json .Image}}' > regular-image.json

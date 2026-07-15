@@ -45,7 +45,11 @@ jobs:
             exit 1
           fi
 
-          git remote set-url upstream "https://github.com/${repository}.git"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${repository}.git"
+          else
+            git remote add upstream "https://github.com/${repository}.git"
+          fi
           git fetch --no-tags upstream "refs/tags/${target_ref}"
           target_commit=$(git rev-parse "FETCH_HEAD^{commit}")
           current_ref=$(python -c 'import json; print(json.load(open(".github/upstream.json"))["ref"])')
