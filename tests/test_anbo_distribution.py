@@ -1,13 +1,16 @@
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from scripts.anbo_distribution import capability_hash, create_manifest, validate_version
 
 
-ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 
