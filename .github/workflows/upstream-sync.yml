@@ -1,0 +1,163 @@
+name: Upstream MiniStack sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Optional upstream release tag, for example v1.4.3"
+        required: false
+        type: string
+
+concurrency:
+  group: upstream-ministack-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: open reviewed upstream sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          repository=$(python -c 'import json; print(json.load(open(".github/upstream.json"))["repository"])')
+          if [ -n "${REQUESTED_REF}" ]; then
+            target_ref="${REQUESTED_REF}"
+          else
+            target_ref=$(gh api "repos/${repository}/releases/latest" --jq .tag_name)
+          fi
+          if ! printf '%s' "${target_ref}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Upstream ref must be a stable vX.Y.Z release tag" >&2
+            exit 1
+          fi
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${repository}.git"
+          else
+            git remote add upstream "https://github.com/${repository}.git"
+          fi
+          git fetch --no-tags upstream "refs/tags/${target_ref}"
+          target_commit=$(git rev-parse "FETCH_HEAD^{commit}")
+          current_ref=$(python -c 'import json; print(json.load(open(".github/upstream.json"))["ref"])')
+          current_commit=$(python -c 'import json; print(json.load(open(".github/upstream.json"))["commit"])')
+          branch="sync/ministack-${target_ref#v}"
+
+          if [ "${target_ref}" = "${current_ref}" ] && [ "${target_commit}" = "${current_commit}" ]; then
+            echo "Already synchronized with ${target_ref} (${target_commit})"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "Sync branch ${branch} already exists; leaving it for review"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "changed=true"
+            echo "repository=${repository}"
+            echo "ref=${target_ref}"
+            echo "commit=${target_commit}"
+            echo "current_ref=${current_ref}"
+            echo "current_commit=${current_commit}"
+            echo "branch=${branch}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Merge upstream into a review branch
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ steps.upstream.outputs.branch }}
+          TARGET_COMMIT: ${{ steps.upstream.outputs.commit }}
+          TARGET_REF: ${{ steps.upstream.outputs.ref }}
+          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
+        run: |
+          set -euo pipefail
+          git config user.name "anbo-upstream-sync[bot]"
+          git config user.email "anbo-upstream-sync[bot]@users.noreply.github.com"
+          git switch -c "${TARGET_BRANCH}"
+
+          set +e
+          git merge --no-commit --no-ff "${TARGET_COMMIT}"
+          merge_status=$?
+          set -e
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -n "${conflicts}" ]; then
+            git merge --abort
+            title="Upstream sync conflict: ${TARGET_REF}"
+            {
+              echo "The scheduled Anbo MiniStack sync could not merge ${UPSTREAM_REPOSITORY} ${TARGET_REF} (${TARGET_COMMIT})."
+              echo
+              echo "Conflicting paths require manual review:"
+              printf '%s\n' "${conflicts}" | sed 's/^/- `/' | sed 's/$/`/'
+              echo
+              echo "No conflict resolution or main-branch update was attempted."
+            } > conflict-issue.md
+            existing=$(gh issue list --state open --search "${title} in:title" --json title,url --jq ".[] | select(.title == \"${title}\") | .url" | head -1)
+            if [ -n "${existing}" ]; then
+              echo "Conflict issue already exists: ${existing}"
+            else
+              gh issue create --title "${title}" --body-file conflict-issue.md
+            fi
+            exit 1
+          fi
+          if [ "${merge_status}" -ne 0 ]; then
+            echo "Upstream merge failed without a resolvable merge result" >&2
+            git merge --abort || true
+            exit "${merge_status}"
+          fi
+
+          TARGET_REF="${TARGET_REF}" TARGET_COMMIT="${TARGET_COMMIT}" python - <<'PY'
+          import json
+          import os
+
+          path = ".github/upstream.json"
+          document = json.load(open(path))
+          document["ref"] = os.environ["TARGET_REF"]
+          document["commit"] = os.environ["TARGET_COMMIT"]
+          with open(path, "w") as output:
+              json.dump(document, output, indent=2)
+              output.write("\n")
+          PY
+          git add .github/upstream.json
+          git commit -m "Sync upstream MiniStack ${TARGET_REF}"
+          git push origin "${TARGET_BRANCH}"
+
+      - name: Open upstream sync pull request
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ steps.upstream.outputs.branch }}
+          TARGET_COMMIT: ${{ steps.upstream.outputs.commit }}
+          TARGET_REF: ${{ steps.upstream.outputs.ref }}
+          CURRENT_COMMIT: ${{ steps.upstream.outputs.current_commit }}
+          CURRENT_REF: ${{ steps.upstream.outputs.current_ref }}
+        run: |
+          cat > sync-pr.md <<EOF
+          Synchronizes the Anbo distribution from upstream MiniStack ${CURRENT_REF} to ${TARGET_REF}.
+
+          Previous upstream commit: \`${CURRENT_COMMIT}\`
+
+          Candidate upstream commit: \`${TARGET_COMMIT}\`
+
+          This PR must pass upstream tests, downstream policy checks, image candidate checks, and Anbo CLI acceptance before merge. Changes to capabilities, Dockerfiles, initialization, health endpoints, or workflows require explicit maintainer review.
+          EOF
+          gh pr create \
+            --base main \
+            --head "${TARGET_BRANCH}" \
+            --title "Sync upstream MiniStack ${TARGET_REF}" \
+            --body-file sync-pr.md

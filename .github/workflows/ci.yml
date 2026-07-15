@@ -11,6 +11,27 @@ env:
   SERIAL_SHARDS: 1
 
 jobs:
+  downstream-policy:
+    name: downstream policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Check downstream release policy
+        run: python scripts/check_downstream_policy.py
+
+      - name: Run downstream distribution tests
+        run: |
+          python -m pip install pytest
+          python -m pytest -o addopts='' --noconftest tests/test_anbo_distribution.py -q
+
   setup:
     name: plan shards
     runs-on: ubuntu-latest
@@ -18,10 +39,10 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       files: ${{ steps.plan.outputs.files }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: "pip"
@@ -49,10 +70,10 @@ jobs:
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: "pip"
@@ -80,23 +101,27 @@ jobs:
           m = json.loads(os.environ['FILES_MAP'])
           print(m.get('${{ matrix.mode }}_${{ matrix.shard_index }}', ''))
           ")
-          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
 
       - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }})
+        env:
+          SHARD_FILES: ${{ steps.shard.outputs.files }}
+          SHARD_MODE: ${{ matrix.mode }}
         run: |
-          if [ -z "${{ steps.shard.outputs.files }}" ]; then
+          if [ -z "${SHARD_FILES}" ]; then
             echo "No tests for this shard"
             exit 0
           fi
-          if [ "${{ matrix.mode }}" = "serial" ]; then
-            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial" --durations=10
+          read -r -a files <<< "${SHARD_FILES}"
+          if [ "${SHARD_MODE}" = "serial" ]; then
+            pytest "${files[@]}" -v --tb=short -m "serial" --durations=10
           else
-            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
+            pytest "${files[@]}" -v -n 3 --dist=loadfile -m "not serial" --durations=25
           fi
 
       - name: Upload MiniStack log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log

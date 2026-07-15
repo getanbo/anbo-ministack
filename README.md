@@ -1,3 +1,13 @@
+> **Anbo MiniStack distribution.** This repository packages the upstream
+> [MiniStack](https://github.com/ministackorg/ministack) runtime for the Anbo
+> CLI. Anbo's downstream changes are deliberately limited to distribution,
+> release security, and compatibility. Existing `ministack` Python imports,
+> environment variables, endpoints, and internal identifiers remain unchanged
+> so upstream updates stay reviewable.
+
+See [DOWNSTREAM.md](DOWNSTREAM.md) for image names, immutable versioning, and
+the upstream update policy.
+
 <p align="center">
   <img src="ministack_logo.png" alt="MiniStack — Free Open-Source AWS Emulator" width="400"/>
 </p>

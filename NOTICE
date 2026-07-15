@@ -1,0 +1,14 @@
+Anbo MiniStack
+Copyright (c) 2026 Anbo contributors
+
+This distribution includes software developed by the MiniStack contributors:
+https://github.com/ministackorg/ministack
+
+The upstream MiniStack source is licensed under the MIT License. The complete
+license text is provided in LICENSE. "Anbo MiniStack" names this downstream
+distribution only. The upstream package name, Python imports, command name,
+environment variables, HTTP endpoints, and internal service labels remain
+MiniStack-compatible.
+
+Downstream release and automation changes are maintained at:
+https://github.com/getanbo/anbo-ministack

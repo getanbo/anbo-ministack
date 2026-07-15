@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "repository": "ministackorg/ministack",
+  "defaultBranch": "main",
+  "ref": "v1.4.2",
+  "commit": "25c2cbad8ff77108823359d3d5c8e92a44726acd",
+  "syncPolicy": {
+    "delivery": "pull-request",
+    "conflicts": "manual"
+  }
+}
