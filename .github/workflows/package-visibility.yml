@@ -1,27 +1,33 @@
-name: Package visibility
+name: Verify public container
 
 on:
+  schedule:
+    - cron: "41 4 * * *"
   workflow_dispatch:
 
 permissions:
-  packages: write
+  contents: read
+
+env:
+  CERTIFIED_DIGEST: sha256:a3142656995ff38d94c6246d9c2f1c6c2eaf9ca48012a2f84d6aac6a2cf14d57
 
 jobs:
   public:
-    name: keep container public
+    name: anonymous pull
     runs-on: ubuntu-latest
     steps:
-      - name: Set the GHCR package to public
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify the certified image is publicly readable
+        shell: bash
         run: |
-          gh api \
-            --method PATCH \
-            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/anbo-ministack" \
-            -f visibility=public
-
-      - name: Verify package visibility
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/anbo-ministack" --jq .visibility)" = public
+          set -euo pipefail
+          token="$(
+            curl --fail --silent --show-error \
+              'https://ghcr.io/token?scope=repository%3Agetanbo%2Fanbo-ministack%3Apull' \
+              | jq -r '.token // empty'
+          )"
+          test -n "$token"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $token" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/getanbo/anbo-ministack/manifests/${CERTIFIED_DIGEST}" \
+            | jq -e '.manifests | length > 0' >/dev/null
