@@ -520,6 +520,12 @@ def _parse_tags_xml(body: bytes) -> dict:
     return tags
 
 
+def _validate_bucket_tags(tags: dict):
+    if len(tags) > 50:
+        return _error("BadRequest", "Bucket tags cannot be greater than 50", 400)
+    return None
+
+
 def _extract_user_metadata(headers: dict) -> dict:
     meta = {}
     for k, v in headers.items():
@@ -936,16 +942,26 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
         return 200, {"Location": f"/{name}"}, b""
 
     region = None
+    tags = None
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
                 region = loc_el.text
+            if _find_xml_tag(xml_root, "Tags") is not None:
+                tags = _parse_tags_xml(body)
         except Exception:
             pass
 
+    if tags is not None:
+        err = _validate_bucket_tags(tags)
+        if err:
+            return err
+
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    if tags:
+        _bucket_tags[name] = tags
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -1373,8 +1389,9 @@ def _put_bucket_tagging(name: str, body: bytes):
         tags = _parse_tags_xml(body)
     except Exception:
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
-    if len(tags) > 50:
-        return _error("BadRequest", "Object tags cannot be greater than 50", 400)
+    err = _validate_bucket_tags(tags)
+    if err:
+        return err
     _bucket_tags[name] = tags
     return 204, {}, b""
 

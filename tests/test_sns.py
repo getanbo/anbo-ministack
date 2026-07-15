@@ -297,6 +297,20 @@ def test_sns_tags(sns):
     assert tags["env"] == "staging"
 
 
+def test_sns_create_topic_with_tags(sns):
+    arn = sns.create_topic(
+        Name="intg-sns-create-tags",
+        Tags=[
+            {"Key": "Project", "Value": "anbo"},
+            {"Key": "ManagedBy", "Value": "terraform"},
+        ],
+    )["TopicArn"]
+
+    response = sns.list_tags_for_resource(ResourceArn=arn)
+    tags = {tag["Key"]: tag["Value"] for tag in response["Tags"]}
+    assert tags == {"Project": "anbo", "ManagedBy": "terraform"}
+
+
 def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
     arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     empty_account_arn = arn.replace(":000000000000:", "::")

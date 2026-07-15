@@ -616,6 +616,78 @@ def test_s3_bucket_tagging(s3):
         s3.get_bucket_tagging(Bucket=bkt)
     assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
 
+
+def test_s3_create_bucket_with_inline_tags(s3):
+    """CreateBucketConfiguration.Tags must survive the tag-on-create path.
+
+    terraform-provider-aws 6.54 sends bucket tags in the CreateBucket request
+    and does not call PutBucketTagging when that request succeeds.
+    """
+    import urllib.request
+
+    bkt = "intg-s3-create-inline-tags"
+    xml_body = (
+        '<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        "<Tags>"
+        "<Tag><Key>Project</Key><Value>anbo</Value></Tag>"
+        "<Tag><Key>ManagedBy</Key><Value>terraform</Value></Tag>"
+        "</Tags>"
+        "</CreateBucketConfiguration>"
+    ).encode()
+    req = urllib.request.Request(
+        f"http://localhost:4566/{bkt}",
+        method="PUT",
+        data=xml_body,
+        headers={"Content-Type": "application/xml"},
+    )
+
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+
+    response = s3.get_bucket_tagging(Bucket=bkt)
+    tags = {tag["Key"]: tag["Value"] for tag in response["TagSet"]}
+    assert tags == {"Project": "anbo", "ManagedBy": "terraform"}
+
+    s3control = make_client("s3control")
+    response = s3control.list_tags_for_resource(
+        AccountId="000000000000",
+        ResourceArn=f"arn:aws:s3:::{bkt}",
+    )
+    tags = {tag["Key"]: tag["Value"] for tag in response["Tags"]}
+    assert tags == {"Project": "anbo", "ManagedBy": "terraform"}
+
+
+def test_s3_create_bucket_rejects_more_than_50_inline_tags(s3):
+    import urllib.error
+    import urllib.request
+
+    bkt = "intg-s3-create-too-many-tags"
+    tag_xml = "".join(
+        f"<Tag><Key>key-{index}</Key><Value>value</Value></Tag>"
+        for index in range(51)
+    )
+    xml_body = (
+        '<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        f"<Tags>{tag_xml}</Tags>"
+        "</CreateBucketConfiguration>"
+    ).encode()
+    req = urllib.request.Request(
+        f"http://localhost:4566/{bkt}",
+        method="PUT",
+        data=xml_body,
+        headers={"Content-Type": "application/xml"},
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req)
+    assert exc.value.code == 400
+    assert "<Code>BadRequest</Code>" in exc.value.read().decode()
+
+    with pytest.raises(ClientError) as exc:
+        s3.head_bucket(Bucket=bkt)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
 def test_s3_control_list_tags_for_resource(s3):
     """S3 Control ListTagsForResource must return tags set via PutBucketTagging.
 
