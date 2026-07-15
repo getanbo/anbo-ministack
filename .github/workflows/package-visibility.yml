@@ -1,0 +1,27 @@
+name: Package visibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  public:
+    name: keep container public
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set the GHCR package to public
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method PATCH \
+            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/anbo-ministack" \
+            -f visibility=public
+
+      - name: Verify package visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/anbo-ministack" --jq .visibility)" = public
