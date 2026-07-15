@@ -30,7 +30,7 @@ jobs:
       - name: Run downstream distribution tests
         run: |
           python -m pip install pytest
-          pytest -o addopts='' --noconftest tests/test_anbo_distribution.py -q
+          python -m pytest -o addopts='' --noconftest tests/test_anbo_distribution.py -q
 
   setup:
     name: plan shards
