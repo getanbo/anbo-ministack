@@ -17,6 +17,7 @@ jobs:
     name: promote tested image digests
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       id-token: write
       packages: write
@@ -112,6 +113,91 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               "${IMAGE}@${digest}"
           done
+
+      - name: Resolve accepted Anbo CLI revision
+        id: cli
+        env:
+          FULL_DIGEST: ${{ steps.candidates.outputs.full }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifact_name="candidate-acceptance-${VERSION}-${GITHUB_SHA}"
+          run_id=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}" \
+            --jq '.artifacts | map(select(.expired == false)) | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty')
+          if [ -z "${run_id}" ]; then
+            echo "No unexpired installed-CLI acceptance evidence found for ${VERSION} at ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          gh run download "${run_id}" --name "${artifact_name}" --dir candidate-acceptance
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          evidence = json.load(open("candidate-acceptance/candidate-acceptance.json"))
+          if evidence.get("schemaVersion") != 1:
+              raise SystemExit("candidate acceptance evidence has an unsupported schema")
+          ministack = evidence.get("ministack", {})
+          expected_tag = f'{os.environ["IMAGE"]}:rc-{os.environ["VERSION"]}-full'
+          if ministack.get("sourceSha") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("candidate acceptance source commit does not match the release")
+          if ministack.get("version") != os.environ["VERSION"]:
+              raise SystemExit("candidate acceptance version does not match the release")
+          if ministack.get("tag") != expected_tag:
+              raise SystemExit("candidate acceptance did not test the release-candidate full tag")
+          if ministack.get("digest") != os.environ["FULL_DIGEST"]:
+              raise SystemExit("candidate acceptance digest does not match the resolved release candidate")
+          cli = evidence.get("anboCli", {})
+          if cli.get("repository") != "getanbo/anbo-cli":
+              raise SystemExit("candidate acceptance used an unexpected CLI repository")
+          commit = cli.get("commit", "")
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit("candidate acceptance does not contain an immutable CLI commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"sha={commit}\n")
+          PY
+
+      - name: Checkout accepted public Anbo CLI
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: getanbo/anbo-cli
+          ref: ${{ steps.cli.outputs.sha }}
+          path: anbo-cli
+
+      - name: Set up Node for installed CLI acceptance
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: anbo-cli/package-lock.json
+
+      - name: Set up Terraform for installed CLI acceptance
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Run packed installed CLI isolation acceptance
+        working-directory: anbo-cli
+        env:
+          MINISTACK_IMAGE: ${{ env.IMAGE }}:rc-${{ steps.release.outputs.version }}-full@${{ steps.candidates.outputs.full }}
+        run: |
+          npm install --global npm@11.6.2
+          npm ci
+          node plugins/ministack/scripts/run-installed-cli-isolation.mjs \
+            --ministack-image "${MINISTACK_IMAGE}" \
+            --diagnostics-root "${GITHUB_WORKSPACE}/acceptance-diagnostics"
+
+      - name: Upload acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-acceptance-diagnostics-${{ steps.release.outputs.version }}-${{ github.run_attempt }}
+          path: acceptance-diagnostics
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Promote exact candidate indexes without rebuilding
         env:

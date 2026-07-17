@@ -45,6 +45,15 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    published_host_port,
+    scoped_name,
+    scoped_volume_name,
+    validated_launch_kwargs,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -193,8 +202,13 @@ def restore_state(data):
             inst["DBInstanceStatus"] = "creating"
             region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
             if RDS_PERSIST:
-                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(instance_id))
-                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(instance_id)
+                if isolation_enabled():
+                    inst["_docker_volume_name"] = _rds_docker_volume_name(
+                        instance_id, account_id, region,
+                    )
+                else:
+                    inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(instance_id))
+                    inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(instance_id)
             _instances._data[(account_id, region, instance_id)] = inst
             to_respawn.append((account_id, region, inst.get("DBInstanceIdentifier") or instance_id, inst))
     else:
@@ -204,8 +218,11 @@ def restore_state(data):
             inst["DBInstanceStatus"] = "creating"
             region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
             if RDS_PERSIST:
-                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(name))
-                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(name)
+                if isolation_enabled():
+                    inst["_docker_volume_name"] = _rds_docker_volume_name(name, region=region)
+                else:
+                    inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(name))
+                    inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(name)
             _instances.set_scoped(get_account_id(), region, name, inst)
             to_respawn.append((None, region, name, inst))
 
@@ -250,11 +267,15 @@ def _rds_docker_scope(account_id=None, region=None):
 
 
 def _rds_docker_name(db_id, account_id=None, region=None):
-    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}"
+    return scoped_name(
+        f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}"
+    )
 
 
 def _rds_docker_volume_name(db_id, account_id=None, region=None):
-    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}-data"
+    return scoped_volume_name(
+        f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}-data"
+    )
 
 
 def _legacy_rds_docker_name(db_id):
@@ -293,17 +314,18 @@ def _start_rds_container_for_instance(db_id, instance):
     # bind 5432 on the host and collide on every respawn (#692 follow-up).
     # Legacy instances persisted before `_HostPort` was stored fall back to a
     # fresh free port from `_next_port()`.
-    host_port = instance.get("_HostPort") or _next_port()
+    host_port = None if isolation_enabled() else (instance.get("_HostPort") or _next_port())
     # If the stored host port was claimed by something else between
     # restarts (another ministack, another db instance, a user app),
     # docker bind would fail with "port is already allocated". Fall
     # back to a fresh free port and persist it so subsequent restarts
     # converge on a stable mapping again.
-    if not _is_host_port_free(host_port):
+    if host_port is not None and not _is_host_port_free(host_port):
         logger.info("RDS: persisted host port %d for %s is in use; "
                     "allocating fresh free port", host_port, db_id)
         host_port = _next_port()
-    instance["_HostPort"] = host_port
+    if host_port is not None:
+        instance["_HostPort"] = host_port
 
     image, env_vars, container_port, data_path = _docker_image_for_engine(
         engine, engine_version, master_user, master_pass, db_name,
@@ -315,11 +337,22 @@ def _start_rds_container_for_instance(db_id, instance):
     container_name = _rds_docker_name(db_id)
     stale_names = [container_name]
     legacy_container_name = instance.pop("_legacy_docker_container_name", None)
-    if legacy_container_name and legacy_container_name != container_name:
+    if (
+        not isolation_enabled()
+        and legacy_container_name
+        and legacy_container_name != container_name
+    ):
         stale_names.append(legacy_container_name)
     for stale_name in stale_names:
         try:
             existing = docker_client.containers.get(stale_name)
+            if isolation_enabled() and not is_owned(existing, "rds"):
+                logger.warning(
+                    "RDS: refusing to remove unowned stale-name container %s",
+                    stale_name,
+                )
+                instance["DBInstanceStatus"] = "failed"
+                return
             # `force=True` stops AND removes in one shot, including
             # half-spawned "Created" containers that didn't fully start
             # — those still hold port mappings and would collide with
@@ -350,17 +383,20 @@ def _start_rds_container_for_instance(db_id, instance):
         environment=env_vars,
         ports={f"{container_port}/tcp": host_port},
         name=container_name,
-        labels={
-            "ministack": "rds",
-            "db_id": db_id,
-            "account_id": get_account_id(),
-            "region": get_region(),
-        },
+        labels=managed_labels(
+            "rds",
+            db_id=db_id,
+            account_id=get_account_id(),
+            region=get_region(),
+        ),
     )
     if ms_network:
         container_kwargs["network"] = ms_network
     if RDS_PERSIST:
-        volume_name = instance.get("_docker_volume_name") or _rds_docker_volume_name(db_id)
+        if isolation_enabled():
+            volume_name = _rds_docker_volume_name(db_id)
+        else:
+            volume_name = instance.get("_docker_volume_name") or _rds_docker_volume_name(db_id)
         instance["_docker_volume_name"] = volume_name
         container_kwargs["volumes"] = {
             volume_name: {"bind": data_path, "mode": "rw"},
@@ -371,13 +407,32 @@ def _start_rds_container_for_instance(db_id, instance):
         }
 
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("rds", container_kwargs)
+        )
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
         return
 
     instance["_docker_container_id"] = container.id
+    if isolation_enabled():
+        host_port = published_host_port(container, container_port)
+        if host_port is None:
+            logger.warning(
+                "RDS: Docker did not report a published port for respawned %s",
+                db_id,
+            )
+            try:
+                if is_owned(container, "rds"):
+                    container.remove(force=True, v=False)
+            except Exception:
+                pass
+            instance["DBInstanceStatus"] = "failed"
+            return
+        instance["_HostPort"] = host_port
+        instance.setdefault("Endpoint", {})["Address"] = _MINISTACK_HOST
+        instance["Endpoint"]["Port"] = host_port
 
     internal_host = None
     internal_port = None
@@ -1055,6 +1110,18 @@ def _create_db_instance(p):
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
     storage_type = _p(p, "StorageType") or "gp2"
     subnet_group_name = _p(p, "DBSubnetGroupName") or "default"
+    explicit_pg = _p(p, "DBParameterGroupName")
+    if (
+        isolation_enabled()
+        and explicit_pg
+        and not explicit_pg.startswith("default.")
+        and explicit_pg not in _param_groups
+    ):
+        return _error(
+            "DBParameterGroupNotFound",
+            f"DBParameterGroup {explicit_pg} not found.",
+            404,
+        )
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
@@ -1081,19 +1148,20 @@ def _create_db_instance(p):
                 # (it's built ~70 lines below). Allocate a fresh free port
                 # and we'll stamp `_HostPort` onto the instance dict at
                 # construction time so subsequent respawns reuse it.
-                host_port = _next_port()
-                endpoint_port = host_port
+                host_port = None if isolation_enabled() else _next_port()
+                if host_port is not None:
+                    endpoint_port = host_port
                 container_kwargs = dict(
                     image=image, detach=True,
                     environment=env,
                     ports={f"{container_port}/tcp": host_port},
                     name=_rds_docker_name(db_id),
-                    labels={
-                        "ministack": "rds",
-                        "db_id": db_id,
-                        "account_id": get_account_id(),
-                        "region": get_region(),
-                    },
+                    labels=managed_labels(
+                        "rds",
+                        db_id=db_id,
+                        account_id=get_account_id(),
+                        region=get_region(),
+                    ),
                 )
                 if ms_network:
                     container_kwargs["network"] = ms_network
@@ -1110,7 +1178,21 @@ def _create_db_instance(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
-                container = docker_client.containers.run(**container_kwargs)
+                container = docker_client.containers.run(
+                    **validated_launch_kwargs("rds", container_kwargs)
+                )
+                if isolation_enabled():
+                    host_port = published_host_port(container, container_port)
+                    if host_port is None:
+                        try:
+                            if is_owned(container, "rds"):
+                                container.remove(force=True, v=False)
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Docker did not report an assigned RDS host port"
+                        )
+                    endpoint_port = host_port
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:
@@ -1137,7 +1219,6 @@ def _create_db_instance(p):
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
     cluster_id = cluster_id_param
-    explicit_pg = _p(p, "DBParameterGroupName")
     # AWS rejects a reference to a parameter group that doesn't exist. Validate
     # custom names against the store; AWS-managed `default.*` groups are implicit
     # and not tracked here, so they're accepted as-is.
@@ -1361,6 +1442,14 @@ def _delete_db_instance(p):
     if docker_client and instance.get("_docker_container_id"):
         try:
             c = docker_client.containers.get(instance["_docker_container_id"])
+            if isolation_enabled() and not is_owned(c, "rds"):
+                logger.warning(
+                    "RDS: refusing to remove unowned container for %s",
+                    instance_id,
+                )
+                c = None
+            if c is None:
+                raise RuntimeError("backing container is not owned by this instance")
             c.stop(timeout=5)
             c.remove(v=True)
             logger.info("RDS: removed container for %s", instance_id)
@@ -3910,6 +3999,12 @@ def reset():
             if cid:
                 try:
                     c = docker_client.containers.get(cid)
+                    if isolation_enabled() and not is_owned(c, "rds"):
+                        logger.warning(
+                            "reset: refusing to remove unowned RDS container %s",
+                            cid,
+                        )
+                        continue
                     c.stop(timeout=2)
                     c.remove(v=True)
                 except Exception as e:

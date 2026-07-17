@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "requiredHelpers": [
+    "is_owned",
+    "isolation_enabled",
+    "managed_labels",
+    "scoped_name",
+    "validated_launch_kwargs"
+  ],
+  "modules": {
+    "ecs": {
+      "service": "ecs",
+      "launchCalls": {
+        "create": 0,
+        "run": 1
+      }
+    },
+    "elasticache": {
+      "service": "elasticache",
+      "launchCalls": {
+        "create": 0,
+        "run": 2
+      }
+    },
+    "eks": {
+      "service": "eks",
+      "launchCalls": {
+        "create": 2,
+        "run": 1
+      }
+    },
+    "glue": {
+      "service": "glue",
+      "launchCalls": {
+        "create": 1,
+        "run": 0
+      }
+    },
+    "lambda_svc": {
+      "service": "lambda",
+      "launchCalls": {
+        "create": 1,
+        "run": 1
+      }
+    },
+    "mwaa": {
+      "service": "mwaa",
+      "launchCalls": {
+        "create": 0,
+        "run": 1
+      }
+    },
+    "opensearch": {
+      "service": "opensearch",
+      "launchCalls": {
+        "create": 0,
+        "run": 2
+      }
+    },
+    "rds": {
+      "service": "rds",
+      "launchCalls": {
+        "create": 0,
+        "run": 2
+      }
+    }
+  }
+}

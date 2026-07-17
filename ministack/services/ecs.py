@@ -32,6 +32,15 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    published_host_port,
+    scoped_name,
+    validated_launch_kwargs,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -84,7 +93,14 @@ def _reap_exited_containers():
         return
     # all=True includes exited containers; reset() uses list() (running only),
     # so this complements — and overlaps harmlessly — with the reset path.
-    for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
+    containers = (
+        owned_containers(docker_client, "ecs", all=True)
+        if isolation_enabled()
+        else docker_client.containers.list(
+            all=True, filters={"label": "ministack=ecs"}
+        )
+    )
+    for c in containers:
         if c.status in ("exited", "dead", "created"):
             try:
                 c.remove(v=True, force=True)
@@ -990,6 +1006,43 @@ def _container_override_for(container_overrides, container_name):
     return {}
 
 
+def _docker_port_bindings(cdef):
+    """Map ECS ports without sharing daemon-global host bindings in scoped mode."""
+    return {
+        f"{mapping['containerPort']}/tcp": (
+            None
+            if isolation_enabled()
+            else mapping.get("hostPort", mapping.get("containerPort"))
+        )
+        for mapping in cdef.get("portMappings", [])
+    }
+
+
+def _docker_host_mode(td):
+    """Use host networking only for the legacy single-instance runtime."""
+    return td.get("networkMode") == "host" and not isolation_enabled()
+
+
+def _docker_network_bindings(container, cdef):
+    """Expose scoped Docker-assigned ports through the ECS task response."""
+    if not isolation_enabled():
+        return []
+
+    bindings = []
+    for mapping in cdef.get("portMappings", []):
+        container_port = mapping["containerPort"]
+        host_port = published_host_port(container, container_port)
+        if host_port is None:
+            continue
+        bindings.append({
+            "bindIP": "0.0.0.0",
+            "containerPort": container_port,
+            "hostPort": host_port,
+            "protocol": mapping.get("protocol", "tcp"),
+        })
+    return bindings
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -1006,15 +1059,17 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         detach=True,
         environment=env,
         ports=port_bindings or None,
-        name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
-        labels={
-            "ministack": "ecs",
-            "com.amazonaws.ecs.cluster": cluster_arn,
-            "com.amazonaws.ecs.container-name": cdef["name"],
-            "com.amazonaws.ecs.task-arn": task_arn,
-            "com.amazonaws.ecs.task-definition-family": td.get("family", ""),
-            "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
-        },
+        name=scoped_name(f"ministack-ecs-{task_id[:8]}-{cdef['name']}"),
+        labels=managed_labels(
+            "ecs",
+            extra={
+                "com.amazonaws.ecs.cluster": cluster_arn,
+                "com.amazonaws.ecs.container-name": cdef["name"],
+                "com.amazonaws.ecs.task-arn": task_arn,
+                "com.amazonaws.ecs.task-definition-family": td.get("family", ""),
+                "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
+            },
+        ),
         command=cdef.get("command"),
         privileged=bool(cdef.get("privileged") or cdef.get("Privileged")),
     )
@@ -1214,12 +1269,12 @@ def _run_task(data):
                 if "command" in container_override:
                     effective_cdef["command"] = container_override["command"]
 
-                port_bindings = {}
-                for pm in cdef.get("portMappings", []):
-                    host_port = pm.get("hostPort", pm.get("containerPort"))
-                    port_bindings[f"{pm['containerPort']}/tcp"] = host_port
+                port_bindings = _docker_port_bindings(cdef)
 
-                host_mode = td.get("networkMode") == "host"
+                # A host namespace is daemon-global. Scoped runtimes use their
+                # private bridge instead so identical task definitions can run
+                # concurrently without binding or network collisions.
+                host_mode = _docker_host_mode(td)
                 metadata_token = _register_metadata(
                     task_arn, _clusters[cluster_name]["clusterArn"],
                     td, cdef, launch_type, env, host_mode, ministack_net_ip,
@@ -1231,12 +1286,18 @@ def _run_task(data):
                 )
 
                 try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    container = docker_client.containers.run(
+                        cdef["image"],
+                        **validated_launch_kwargs("ecs", run_kwargs),
+                    )
                     task["_docker_ids"].append(container.id)
                     ecs_metadata.set_docker_id(metadata_token, container.id)
                     task.setdefault("_metadata_tokens", []).append(metadata_token)
                     if i < len(task["containers"]):
                         task["containers"][i]["runtimeId"] = container.id[:12]
+                        task["containers"][i]["networkBindings"] = (
+                            _docker_network_bindings(container, cdef)
+                        )
                     logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
                 except Exception as e:
                     ecs_metadata.unregister_token(metadata_token)
@@ -1271,6 +1332,12 @@ def _stop_task(data):
         for docker_id in task.get("_docker_ids", []):
             try:
                 c = docker_client.containers.get(docker_id)
+                if isolation_enabled() and not is_owned(c, "ecs"):
+                    logger.warning(
+                        "ECS: refusing to stop unowned container %s",
+                        docker_id,
+                    )
+                    continue
                 c.stop(timeout=5)
                 c.remove(v=True)
             except Exception as e:
@@ -2076,7 +2143,14 @@ def reset():
         # (echo, wget probes) leave Exited containers behind that otherwise
         # only the background reaper would remove.
         try:
-            for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
+            containers = (
+                owned_containers(docker_client, "ecs", all=True)
+                if isolation_enabled()
+                else docker_client.containers.list(
+                    all=True, filters={"label": "ministack=ecs"}
+                )
+            )
+            for c in containers:
                 try:
                     if c.status == "running":
                         c.stop(timeout=2)

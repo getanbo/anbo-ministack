@@ -22,6 +22,16 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    published_host_port,
+    scoped_name,
+    scoped_volume_name,
+    validated_launch_kwargs,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -268,7 +278,8 @@ def _start_airflow_container(env_name, env):
         env["WebserverUrl"] = f"localhost:{_next_port()}"
         return
 
-    host_port = _next_port()
+    scoped = isolation_enabled()
+    host_port = None if scoped else _next_port()
     env["_host_port"] = host_port
     ms_network = _get_ministack_network(docker_client)
 
@@ -308,15 +319,29 @@ def _start_airflow_container(env_name, env):
         env_key = key.replace(".", "__").upper()
         container_env[f"AIRFLOW__{env_key}"] = value
 
+    container = None
     try:
-        container_name = f"ministack-mwaa-{env_name}"
+        container_name = scoped_name(f"ministack-mwaa-{env_name}")
 
-        # Remove stale container from previous runs (same pattern as RDS)
-        try:
-            existing = docker_client.containers.get(container_name)
-            existing.remove(force=True)
-        except Exception:
-            pass
+        # Remove stale container from previous runs (same pattern as RDS).
+        # The unscoped path remains upstream's best-effort cleanup.
+        if scoped:
+            try:
+                existing = docker_client.containers.get(container_name)
+            except Exception:
+                existing = None
+            if existing is not None:
+                if not is_owned(existing, "mwaa"):
+                    raise RuntimeError(
+                        f"refusing to replace foreign container {container_name}"
+                    )
+                existing.remove(force=True)
+        else:
+            try:
+                existing = docker_client.containers.get(container_name)
+                existing.remove(force=True)
+            except Exception:
+                pass
 
         container_kwargs = dict(
             image=image,
@@ -325,7 +350,10 @@ def _start_airflow_container(env_name, env):
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
             name=container_name,
-            labels={"ministack": "mwaa", "env_name": env_name},
+            labels=managed_labels(
+                "mwaa",
+                {"ministack": "mwaa", "env_name": env_name},
+            ),
         )
 
         if ms_network:
@@ -333,11 +361,19 @@ def _start_airflow_container(env_name, env):
 
         if MWAA_PERSIST:
             container_kwargs["volumes"] = {
-                f"ministack-mwaa-{env_name}-dags": {"bind": "/opt/airflow/dags", "mode": "rw"},
-                f"ministack-mwaa-{env_name}-db": {"bind": "/opt/airflow", "mode": "rw"},
+                scoped_volume_name(f"ministack-mwaa-{env_name}-dags"): {
+                    "bind": "/opt/airflow/dags",
+                    "mode": "rw",
+                },
+                scoped_volume_name(f"ministack-mwaa-{env_name}-db"): {
+                    "bind": "/opt/airflow",
+                    "mode": "rw",
+                },
             }
 
-        container = docker_client.containers.run(**container_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("mwaa", container_kwargs)
+        )
         env["_docker_container_id"] = container.id
 
         internal_host = "localhost"
@@ -350,6 +386,14 @@ def _start_airflow_container(env_name, env):
             if container_ip:
                 internal_host = container_ip
                 internal_port = container_port
+        if scoped and internal_port is None:
+            host_port = published_host_port(container, container_port)
+            if host_port is None:
+                raise RuntimeError(
+                    f"Docker did not publish a host port for {container_port}/tcp"
+                )
+            env["_host_port"] = host_port
+            internal_port = host_port
 
         env["WebserverUrl"] = f"{internal_host}:{internal_port}"
 
@@ -379,6 +423,11 @@ def _start_airflow_container(env_name, env):
         threading.Thread(target=_bg_init, daemon=True).start()
 
     except Exception as e:
+        if scoped and container is not None and is_owned(container, "mwaa"):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         logger.exception("MWAA: failed to start Airflow container for %s", env_name)
         env["Status"] = "CREATE_FAILED"
         env["WebserverUrl"] = ""
@@ -471,6 +520,8 @@ def _delete_environment(method, path, headers, body, query_params):
         if docker_client:
             try:
                 container = docker_client.containers.get(container_id)
+                if isolation_enabled() and not is_owned(container, "mwaa"):
+                    raise RuntimeError("refusing to remove a foreign container")
                 container.stop(timeout=5)
                 container.remove(force=True)
             except Exception:
@@ -676,14 +727,35 @@ async def handle_request(method, path, headers, body, query_params):
 def reset():
     """Stop all containers and clear state."""
     docker_client = _get_docker()
-    for name, env in list(_environments.items()):
-        container_id = env.get("_docker_container_id")
-        if container_id and docker_client:
+    if docker_client and isolation_enabled():
+        try:
+            containers = owned_containers(
+                docker_client,
+                "mwaa",
+                all=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "reset: failed to list owned MWAA containers: %s",
+                e,
+            )
+            containers = []
+        for container in containers:
             try:
-                container = docker_client.containers.get(container_id)
                 container.stop(timeout=5)
                 container.remove(force=True)
             except Exception:
                 pass
+    else:
+        for name, env in list(_environments.items()):
+            container_id = env.get("_docker_container_id")
+            if container_id and docker_client:
+                try:
+                    container = docker_client.containers.get(container_id)
+                    container.stop(timeout=5)
+                    container.remove(force=True)
+                except Exception:
+                    pass
+    for name, env in list(_environments.items()):
         _release_port(env.get("_host_port"))
     _environments.clear()

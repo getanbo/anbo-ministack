@@ -31,6 +31,11 @@ on:
         description: "Optional immutable release candidate version, for example 1.4.2-anbo.1"
         required: false
         type: string
+      anbo_cli_ref:
+        description: "Anbo CLI branch or commit used for installed-CLI acceptance"
+        required: false
+        default: main
+        type: string
 
 concurrency:
   group: anbo-image-candidate-${{ github.ref }}-${{ inputs.release_version || github.sha }}
@@ -80,6 +85,7 @@ jobs:
     name: publish ${{ matrix.variant }} candidate
     if: github.event_name != 'pull_request' && github.repository == 'getanbo/anbo-ministack'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: write
@@ -136,11 +142,38 @@ jobs:
           fi
           tag="${base_tag}${VARIANT_SUFFIX}"
           if docker buildx imagetools inspect "${IMAGE}:${tag}" >/dev/null 2>&1; then
-            echo "Refusing to overwrite immutable candidate ${IMAGE}:${tag}" >&2
-            exit 1
+            digest=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            echo "Reusing existing immutable candidate ${IMAGE}:${tag}@${digest}"
+            echo "existing=true" >> "${GITHUB_OUTPUT}"
+            echo "existing_digest=${digest}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "existing=false" >> "${GITHUB_OUTPUT}"
           fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify reused candidate provenance
+        if: steps.candidate.outputs.existing == 'true'
+        env:
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${CANDIDATE_TAG}" \
+            --format '{{json .Image}}' > existing-image.json
+          python - <<'PY'
+          import json
+          import os
+
+          images = json.load(open("existing-image.json"))
+          if not images:
+              raise SystemExit("existing candidate has no platform manifests")
+          for platform, image in images.items():
+              labels = image.get("config", {}).get("Labels", {}) or {}
+              if labels.get("org.opencontainers.image.version") != os.environ["CANDIDATE_VERSION"]:
+                  raise SystemExit(f"existing candidate {platform} has the wrong version label")
+              if labels.get("org.opencontainers.image.revision") != os.environ["GITHUB_SHA"]:
+                  raise SystemExit(f"existing candidate {platform} was built from another source commit")
+          PY
 
       - name: Generate OCI metadata
         id: metadata
@@ -159,6 +192,7 @@ jobs:
 
       - name: Build and push candidate once
         id: build
+        if: steps.candidate.outputs.existing != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -173,10 +207,23 @@ jobs:
           provenance: mode=max
           sbom: true
 
+      - name: Resolve immutable candidate digest
+        id: image
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.candidate.outputs.existing_digest }}
+        run: |
+          digest="${BUILT_DIGEST:-${EXISTING_DIGEST}}"
+          if ! printf '%s' "${digest}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "Candidate did not resolve to an immutable sha256 digest" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
       - name: Scan candidate for high and critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
           format: table
           exit-code: "1"
           ignore-unfixed: true
@@ -185,7 +232,7 @@ jobs:
       - name: Create CycloneDX SBOM
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
           format: cyclonedx
           output: sbom-${{ matrix.variant }}.cdx.json
 
@@ -194,21 +241,21 @@ jobs:
 
       - name: Sign candidate digest with GitHub OIDC
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.image.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
 
       - name: Record candidate digest
         env:
           CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
           CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.image.outputs.digest }}
           VARIANT: ${{ matrix.variant }}
         run: |
           python - <<'PY'
@@ -239,10 +286,152 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  candidate-acceptance:
+    name: packed CLI isolation acceptance
+    if: github.event_name != 'pull_request' && github.repository == 'getanbo/anbo-ministack'
+    needs: publish-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    steps:
+      - name: Download full candidate evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${GITHUB_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "candidate-full-${GITHUB_SHA}" \
+            --dir candidate-evidence
+
+      - name: Resolve tested candidate
+        id: candidate
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          record = json.load(open("candidate-evidence/candidate-full.json"))
+          if record["sourceSha"] != os.environ["GITHUB_SHA"]:
+              raise SystemExit("candidate evidence does not match this source commit")
+          digest_reference = record["reference"]
+          if not digest_reference.startswith("ghcr.io/getanbo/anbo-ministack@sha256:"):
+              raise SystemExit("candidate evidence does not contain an immutable Anbo MiniStack reference")
+          tag = record["tag"]
+          if not tag.startswith("ghcr.io/getanbo/anbo-ministack:") or not tag.endswith("-full"):
+              raise SystemExit("candidate evidence does not identify the full image tag")
+          reference = f'{tag}@{record["digest"]}'
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"reference={reference}\n")
+              output.write(f"tag={tag}\n")
+              output.write(f"digest={record['digest']}\n")
+              output.write(f"version={record['version']}\n")
+          PY
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout public Anbo CLI
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: getanbo/anbo-cli
+          ref: ${{ inputs.anbo_cli_ref || 'main' }}
+          path: anbo-cli
+
+      - name: Record exact Anbo CLI revision
+        id: cli-revision
+        working-directory: anbo-cli
+        env:
+          REQUESTED_REF: ${{ inputs.anbo_cli_ref || 'main' }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          printf 'sha=%s\n' "${sha}" >> "${GITHUB_OUTPUT}"
+          printf 'requested_ref=%s\n' "${REQUESTED_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Node for installed CLI acceptance
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: anbo-cli/package-lock.json
+
+      - name: Set up Terraform for installed CLI acceptance
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Run packed installed CLI isolation acceptance
+        working-directory: anbo-cli
+        env:
+          MINISTACK_IMAGE: ${{ steps.candidate.outputs.reference }}
+        run: |
+          npm install --global npm@11.6.2
+          npm ci
+          node plugins/ministack/scripts/run-installed-cli-isolation.mjs \
+            --ministack-image "${MINISTACK_IMAGE}" \
+            --diagnostics-root "${GITHUB_WORKSPACE}/acceptance-diagnostics"
+
+      - name: Upload acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: candidate-acceptance-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: acceptance-diagnostics
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Record acceptance evidence
+        env:
+          ANBO_CLI_REQUESTED_REF: ${{ steps.cli-revision.outputs.requested_ref }}
+          ANBO_CLI_SHA: ${{ steps.cli-revision.outputs.sha }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          CANDIDATE_REFERENCE: ${{ steps.candidate.outputs.reference }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          evidence = {
+              "schemaVersion": 1,
+              "ministack": {
+                  "sourceSha": os.environ["GITHUB_SHA"],
+                  "version": os.environ["CANDIDATE_VERSION"],
+                  "tag": os.environ["CANDIDATE_TAG"],
+                  "digest": os.environ["CANDIDATE_DIGEST"],
+                  "testedReference": os.environ["CANDIDATE_REFERENCE"],
+              },
+              "anboCli": {
+                  "repository": "getanbo/anbo-cli",
+                  "requestedRef": os.environ["ANBO_CLI_REQUESTED_REF"],
+                  "commit": os.environ["ANBO_CLI_SHA"],
+              },
+          }
+          with open("candidate-acceptance.json", "w") as output:
+              json.dump(evidence, output, indent=2, sort_keys=True)
+              output.write("\n")
+          PY
+
+      - name: Upload acceptance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: candidate-acceptance-${{ steps.candidate.outputs.version }}-${{ github.sha }}
+          path: candidate-acceptance.json
+          if-no-files-found: error
+          retention-days: 30
+
   candidate-result:
     name: candidate
     if: always()
-    needs: [build-pr, publish-candidate]
+    needs: [build-pr, publish-candidate, candidate-acceptance]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -251,9 +440,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_RESULT: ${{ needs.build-pr.result }}
           PUBLISH_RESULT: ${{ needs.publish-candidate.result }}
+          ACCEPTANCE_RESULT: ${{ needs.candidate-acceptance.result }}
         run: |
           if [ "${EVENT_NAME}" = "pull_request" ]; then
             [ "${PR_RESULT}" = "success" ]
           else
             [ "${PUBLISH_RESULT}" = "success" ]
+            [ "${ACCEPTANCE_RESULT}" = "success" ]
           fi

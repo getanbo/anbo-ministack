@@ -154,6 +154,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2",
 })
 
+from ministack.core import docker_scope as _docker_scope
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
@@ -551,6 +552,7 @@ def _handle_health_request(path: str, request_id: str):
     """Return health responses for MiniStack and LocalStack-compatible endpoints."""
     if path not in _HEALTH_PATHS:
         return None
+    instance_isolation = _docker_scope.contract_metadata()
     return (
         200,
         {
@@ -563,6 +565,7 @@ def _handle_health_request(path: str, request_id: str):
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
                 "version": _VERSION,
                 "ready_scripts": dict(_ready_scripts_state),
+                **({"instance_isolation": instance_isolation} if instance_isolation is not None else {}),
             }
         ).encode(),
     )
@@ -1883,13 +1886,18 @@ async def _handle_lifespan(scope, receive, send):
 
 
 def _stop_docker_containers():
-    """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state.
+    """Stop Docker containers managed by this MiniStack process.
+
+    The legacy path intentionally retains global service-label cleanup.  When
+    instance isolation is enabled, every destructive operation is constrained
+    to containers whose instance ownership labels pass client-side
+    verification.
 
     Skip entirely if no Docker socket is available: importing the docker
     SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
     Python heap before we even know whether there's anything to clean.
     """
+    isolated = _docker_scope.isolation_enabled()
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
     if sock.startswith("unix://"):
         sock_path = sock[len("unix://"):]
@@ -1901,6 +1909,22 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
+
+    if isolated:
+        try:
+            # all=True also finds exited orphans from a hard-killed process.
+            containers = _docker_scope.owned_containers(client, all=True)
+        except Exception:
+            return
+        for container in containers:
+            try:
+                _docker_scope.remove_owned(container)
+            except Exception:
+                pass
+        return
+
+    # Preserve MiniStack's historical single-instance cleanup exactly when
+    # MINISTACK_INSTANCE_ID is not configured.
     for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
         try:
             # all=True so exited-but-not-removed orphans get cleaned at boot.

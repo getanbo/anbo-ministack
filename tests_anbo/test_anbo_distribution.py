@@ -10,7 +10,6 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.anbo_distribution import capability_hash, create_manifest, validate_version
 
-
 SHA = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 
@@ -37,8 +36,11 @@ def test_capability_hash_is_deterministic_and_content_addressed(tmp_path):
     before = capability_hash(tmp_path)
     assert before.startswith("sha256:")
     assert before == capability_hash(tmp_path)
+    (tmp_path / "ministack" / "core" / "docker_scope.py").write_text("contract = 1\n")
+    with_core_contract = capability_hash(tmp_path)
+    assert with_core_contract != before
     (tmp_path / "ministack" / "services" / "s3.py").write_text("surface = 's3-v2'\n")
-    assert capability_hash(tmp_path) != before
+    assert capability_hash(tmp_path) != with_core_contract
 
 
 def test_release_manifest_records_exact_digests(tmp_path):
@@ -68,3 +70,8 @@ def test_release_manifest_records_exact_digests(tmp_path):
     assert manifest["version"] == "1.4.2-anbo.2"
     assert manifest["images"]["regular"]["reference"].endswith(f"@{DIGEST}")
     assert manifest["capabilities"]["hash"].startswith("sha256:")
+    assert manifest["runtimeCompatibility"]["instanceIsolation"] == {
+        "contractVersion": 1,
+        "environment": "MINISTACK_INSTANCE_ID",
+        "healthField": "instance_isolation",
+    }
