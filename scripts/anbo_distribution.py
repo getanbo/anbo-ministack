@@ -9,7 +9,6 @@ import json
 import re
 from pathlib import Path
 
-
 RELEASE_VERSION = re.compile(r"^(?P<upstream>\d+\.\d+\.\d+)-anbo\.(?P<revision>[1-9]\d*)$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SOURCE_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -30,14 +29,8 @@ def validate_version(version: str, upstream_ref: str) -> str:
 
 
 def capability_hash(root: Path) -> str:
-    """Hash the service surface and router used to expose it."""
-    paths = sorted((root / "ministack" / "services").glob("*.py"))
-    paths.extend(
-        [
-            root / "ministack" / "app.py",
-            root / "ministack" / "core" / "router.py",
-        ]
-    )
+    """Hash the complete Python runtime surface shipped by MiniStack."""
+    paths = sorted((root / "ministack").rglob("*.py"))
     digest = hashlib.sha256()
     for path in sorted(paths):
         relative = path.relative_to(root).as_posix().encode()
@@ -92,6 +85,13 @@ def create_manifest(args: argparse.Namespace) -> dict:
                 "tag": f"{image}:{version}-full",
                 "digest": args.full_digest,
                 "reference": f"{image}@{args.full_digest}",
+            },
+        },
+        "runtimeCompatibility": {
+            "instanceIsolation": {
+                "contractVersion": 1,
+                "environment": "MINISTACK_INSTANCE_ID",
+                "healthField": "instance_isolation",
             },
         },
         "capabilities": {"hash": capability_hash(root)},

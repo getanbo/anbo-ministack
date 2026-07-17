@@ -56,19 +56,7 @@ jobs:
           current_commit=$(python -c 'import json; print(json.load(open(".github/upstream.json"))["commit"])')
           branch="sync/ministack-${target_ref#v}"
 
-          if [ "${target_ref}" = "${current_ref}" ] && [ "${target_commit}" = "${current_commit}" ]; then
-            echo "Already synchronized with ${target_ref} (${target_commit})"
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          if git ls-remote --exit-code --heads origin "refs/heads/${branch}" >/dev/null 2>&1; then
-            echo "Sync branch ${branch} already exists; leaving it for review"
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
           {
-            echo "changed=true"
             echo "repository=${repository}"
             echo "ref=${target_ref}"
             echo "commit=${target_commit}"
@@ -76,6 +64,90 @@ jobs:
             echo "current_commit=${current_commit}"
             echo "branch=${branch}"
           } >> "${GITHUB_OUTPUT}"
+
+          if [ "${target_ref}" = "${current_ref}" ] && [ "${target_commit}" = "${current_commit}" ]; then
+            echo "Already synchronized with ${target_ref} (${target_commit})"
+            {
+              echo "changed=false"
+              echo "state=current"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "Sync branch ${branch} already exists and requires review"
+            {
+              echo "changed=false"
+              echo "state=existing"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "changed=true"
+            echo "state=new"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Surface existing sync branch
+        if: steps.upstream.outputs.state == 'existing'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ steps.upstream.outputs.branch }}
+          TARGET_COMMIT: ${{ steps.upstream.outputs.commit }}
+          TARGET_REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+          branch_url="https://github.com/${GITHUB_REPOSITORY}/tree/${TARGET_BRANCH}"
+          pr_url=$(gh pr list \
+            --state open \
+            --head "${TARGET_BRANCH}" \
+            --json url \
+            --jq '.[0].url // ""')
+
+          {
+            echo "### Existing upstream sync"
+            echo
+            echo "- Target: \`${TARGET_REF}\` (\`${TARGET_COMMIT}\`)"
+            echo "- Review branch: [\`${TARGET_BRANCH}\`](${branch_url})"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ -n "${pr_url}" ]; then
+            echo "- Pull request: ${pr_url}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "Existing sync pull request: ${pr_url}"
+            exit 0
+          fi
+
+          title="Upstream sync branch awaiting review: ${TARGET_REF}"
+          conflict_title="Upstream sync conflict: ${TARGET_REF}"
+          {
+            echo "The automated sync found an existing remote review branch without an open pull request."
+            echo
+            echo "- Branch: [\`${TARGET_BRANCH}\`](${branch_url})"
+            echo "- Upstream target: \`${TARGET_REF}\` (\`${TARGET_COMMIT}\`)"
+            echo
+            echo "Inspect the branch, finish any recorded conflict resolution, and open a pull request to \`main\`."
+            echo "Do not delete the branch until the sync is merged or intentionally abandoned."
+          } > existing-branch-issue.md
+          issue_url=$(gh issue list \
+            --state open \
+            --search "${conflict_title} in:title" \
+            --json title,url \
+            --jq ".[] | select(.title == \"${conflict_title}\") | .url" \
+            | head -1)
+          if [ -z "${issue_url}" ]; then
+            issue_url=$(gh issue list \
+              --state open \
+              --search "${title} in:title" \
+              --json title,url \
+              --jq ".[] | select(.title == \"${title}\") | .url" \
+              | head -1)
+          fi
+          if [ -z "${issue_url}" ]; then
+            issue_url=$(gh issue create \
+              --title "${title}" \
+              --body-file existing-branch-issue.md)
+          fi
+          echo "- Tracking issue: ${issue_url}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Existing sync tracking issue: ${issue_url}"
 
       - name: Merge upstream into a review branch
         if: steps.upstream.outputs.changed == 'true'
@@ -98,21 +170,65 @@ jobs:
           conflicts=$(git diff --name-only --diff-filter=U)
           if [ -n "${conflicts}" ]; then
             git merge --abort
+            report_path=".github/upstream-conflicts/${TARGET_REF}.md"
+            mkdir -p "$(dirname "${report_path}")"
+            {
+              echo "# Upstream sync conflicts for ${TARGET_REF}"
+              echo
+              echo "The automated merge of \`${UPSTREAM_REPOSITORY}\`"
+              echo "\`${TARGET_COMMIT}\` stopped without choosing a resolution."
+              echo
+              echo "## Conflicting paths"
+              echo
+              printf '%s\n' "${conflicts}" | sed 's/^/- `/' | sed 's/$/`/'
+              echo
+              echo "## Resume on this branch"
+              echo
+              echo '```bash'
+              echo "git fetch upstream refs/tags/${TARGET_REF}"
+              echo "git switch ${TARGET_BRANCH}"
+              echo "git merge --no-ff ${TARGET_COMMIT}"
+              echo "# Resolve the paths above and run all CI gates."
+              echo "git rm ${report_path}"
+              echo "git add --all"
+              echo "git commit"
+              echo "git push origin ${TARGET_BRANCH}"
+              echo '```'
+              echo
+              echo "The conflict report must be removed by the resolution commit."
+            } > "${report_path}"
+            git add "${report_path}"
+            git commit -m "Record upstream sync conflicts for ${TARGET_REF}"
+            git push --set-upstream origin "${TARGET_BRANCH}"
+
+            branch_url="https://github.com/${GITHUB_REPOSITORY}/tree/${TARGET_BRANCH}"
             title="Upstream sync conflict: ${TARGET_REF}"
             {
               echo "The scheduled Anbo MiniStack sync could not merge ${UPSTREAM_REPOSITORY} ${TARGET_REF} (${TARGET_COMMIT})."
               echo
+              echo "A remote review branch and conflict report were preserved:"
+              echo
+              echo "- Branch: [\`${TARGET_BRANCH}\`](${branch_url})"
+              echo "- Report: [\`${report_path}\`](${branch_url}/${report_path})"
+              echo
               echo "Conflicting paths require manual review:"
               printf '%s\n' "${conflicts}" | sed 's/^/- `/' | sed 's/$/`/'
               echo
-              echo "No conflict resolution or main-branch update was attempted."
+              echo "Follow the commands in the report, remove it in the resolution commit, and push the same branch."
+              echo "No conflict resolution or main-branch update was attempted automatically."
             } > conflict-issue.md
-            existing=$(gh issue list --state open --search "${title} in:title" --json title,url --jq ".[] | select(.title == \"${title}\") | .url" | head -1)
+            existing=$(gh issue list --state open --search "${title} in:title" --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -1)
             if [ -n "${existing}" ]; then
-              echo "Conflict issue already exists: ${existing}"
+              gh issue comment "${existing}" --body-file conflict-issue.md
             else
               gh issue create --title "${title}" --body-file conflict-issue.md
             fi
+            {
+              echo "### Upstream sync needs conflict resolution"
+              echo
+              echo "- Review branch: [\`${TARGET_BRANCH}\`](${branch_url})"
+              echo "- Conflict report: [\`${report_path}\`](${branch_url}/${report_path})"
+            } >> "${GITHUB_STEP_SUMMARY}"
             exit 1
           fi
           if [ "${merge_status}" -ne 0 ]; then

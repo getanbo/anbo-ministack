@@ -8,7 +8,6 @@ import re
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 PINNED_ACTION = re.compile(r"\buses:\s*[^\s@]+@([0-9a-f]{40})(?:\s*#.*)?$")
@@ -19,6 +18,14 @@ BANNED_PUBLISH_MARKERS = (
     "ministackorg/ministack-preview-build",
     "nahuelnucera/ministack",
     "pypa/gh-action-pypi-publish",
+)
+REQUIRED_DOWNSTREAM_PATHS = (
+    ".github/downstream-docker-ownership.json",
+    ".github/workflows/anbo-downstream-ci.yml",
+    "DOWNSTREAM.md",
+    "NOTICE",
+    "scripts/check_docker_ownership.py",
+    "tests_anbo",
 )
 
 
@@ -50,8 +57,29 @@ def main() -> int:
     readme = (ROOT / "README.md").read_text()
     if not readme.startswith("> **Anbo MiniStack distribution.**"):
         errors.append("README must retain the downstream distribution notice before upstream content")
-    if not (ROOT / "NOTICE").is_file() or not (ROOT / "DOWNSTREAM.md").is_file():
-        errors.append("NOTICE and DOWNSTREAM.md are required downstream provenance files")
+
+    for relative_path in REQUIRED_DOWNSTREAM_PATHS:
+        if not (ROOT / relative_path).exists():
+            errors.append(f"required downstream path is missing: {relative_path}")
+
+    ci_path = WORKFLOWS / "anbo-downstream-ci.yml"
+    if ci_path.is_file():
+        ci_text = ci_path.read_text()
+        if not re.search(r"(?m)^  tests:\s*$", ci_text):
+            errors.append("downstream CI must keep tests in a distinct tests job")
+        if "python scripts/check_docker_ownership.py" not in ci_text:
+            errors.append("downstream CI must run the Docker ownership policy guard")
+        if not re.search(r"python -m pytest[^\n]*\btests_anbo\b", ci_text):
+            errors.append("the downstream tests job must run tests from tests_anbo")
+    else:
+        errors.append(".github/workflows/anbo-downstream-ci.yml is required")
+
+    downstream_doc_path = ROOT / "DOWNSTREAM.md"
+    if (
+        downstream_doc_path.is_file()
+        and "MINISTACK_INSTANCE_ID" not in downstream_doc_path.read_text()
+    ):
+        errors.append("DOWNSTREAM.md must document the opt-in instance isolation boundary")
 
     if errors:
         print("Downstream policy violations:", file=sys.stderr)
