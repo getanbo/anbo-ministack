@@ -27,6 +27,14 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    published_host_port,
+    scoped_name,
+)
 from ministack.core.responses import (
     AccountScopedDict,
     apply_image_prefix,
@@ -99,10 +107,15 @@ def reset():
     _change_progress.clear()
     docker = _get_docker()
     if docker is not None:
-        for c in docker.containers.list(
-            all=True,
-            filters={"label": "com.ministack.service=opensearch"},
-        ):
+        containers = (
+            owned_containers(docker, "opensearch", all=True)
+            if isolation_enabled()
+            else docker.containers.list(
+                all=True,
+                filters={"label": "com.ministack.service=opensearch"},
+            )
+        )
+        for c in containers:
             try:
                 c.stop(timeout=2)
                 c.remove(force=True)
@@ -207,11 +220,11 @@ def _get_docker():
 
 
 def _container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-{domain_name}"
+    return scoped_name(f"ministack-opensearch-{domain_name}")
 
 
 def _dashboards_container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-dashboards-{domain_name}"
+    return scoped_name(f"ministack-opensearch-dashboards-{domain_name}")
 
 
 def _spawn_dataplane(domain_name: str, engine_version: str):
@@ -238,11 +251,15 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         )
         return stub_host, stub_port, None, None, None
 
-    with _state_lock:
-        host_port = _port_counter[0]
-        _port_counter[0] += 1
-        dash_host_port = _dashboards_port_counter[0]
-        _dashboards_port_counter[0] += 1
+    scoped = isolation_enabled()
+    host_port = None
+    dash_host_port = None
+    if not scoped:
+        with _state_lock:
+            host_port = _port_counter[0]
+            _port_counter[0] += 1
+            dash_host_port = _dashboards_port_counter[0]
+            _dashboards_port_counter[0] += 1
 
     image = apply_image_prefix(DEFAULT_IMAGE)
     labels = {
@@ -250,6 +267,8 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         "com.ministack.domain": domain_name,
         "com.docker.compose.project": "ministack",
     }
+    if scoped:
+        labels = managed_labels("opensearch", labels)
     env_vars = {
         "discovery.type": "single-node",
         # Disable security plugin so test code can talk to the cluster
@@ -270,6 +289,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         run_kwargs["network"] = DOCKER_NETWORK
 
     cid = None
+    container = None
     endpoint_host, endpoint_port = _MINISTACK_HOST, host_port
     try:
         container = docker.containers.run(**run_kwargs)
@@ -281,16 +301,28 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             if ip:
                 endpoint_host = ip
                 endpoint_port = 9200
+        if scoped and endpoint_port is None:
+            endpoint_port = published_host_port(container, 9200)
+            if endpoint_port is None:
+                raise RuntimeError(
+                    "Docker did not publish a host port for 9200/tcp"
+                )
         logger.info(
             "OpenSearch: started container %s at %s:%s (image=%s)",
             domain_name, endpoint_host, endpoint_port, image,
         )
     except Exception as e:
+        if scoped and container is not None and is_owned(container, "opensearch"):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         logger.warning("OpenSearch: Docker failed for %s: %s", domain_name, e)
         return stub_host, stub_port, None, None, None
 
     dash_endpoint, dash_cid = None, None
     if DASHBOARDS_ENABLED:
+        dash_container = None
         try:
             dash_kwargs = dict(
                 image=apply_image_prefix(DASHBOARDS_IMAGE),
@@ -307,12 +339,33 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
                 dash_kwargs["network"] = DOCKER_NETWORK
             dash_container = docker.containers.run(**dash_kwargs)
             dash_cid = dash_container.id
-            dash_endpoint = f"{_MINISTACK_HOST}:{dash_host_port}"
+            dash_endpoint_host = _MINISTACK_HOST
+            if scoped and DOCKER_NETWORK:
+                dash_container.reload()
+                networks = dash_container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
+                if ip:
+                    dash_endpoint_host = ip
+                    dash_host_port = 5601
+            if scoped and dash_host_port is None:
+                dash_host_port = published_host_port(dash_container, 5601)
+                if dash_host_port is None:
+                    raise RuntimeError(
+                        "Docker did not publish a host port for 5601/tcp"
+                    )
+            dash_endpoint = f"{dash_endpoint_host}:{dash_host_port}"
             logger.info(
                 "OpenSearch Dashboards: started %s on port %s",
                 domain_name, dash_host_port,
             )
         except Exception as e:
+            if scoped and dash_container is not None and is_owned(
+                dash_container, "opensearch"
+            ):
+                try:
+                    dash_container.remove(force=True)
+                except Exception:
+                    pass
             logger.warning("OpenSearch Dashboards: failed for %s: %s", domain_name, e)
 
     return endpoint_host, endpoint_port, cid, dash_endpoint, dash_cid
@@ -327,6 +380,9 @@ def _teardown_dataplane(rec: dict) -> None:
             continue
         try:
             c = docker.containers.get(cid)
+            if isolation_enabled() and not is_owned(c, "opensearch"):
+                logger.warning("OpenSearch: refusing to remove foreign container %s", cid)
+                continue
             c.stop(timeout=2)
             c.remove(force=True)
         except Exception:

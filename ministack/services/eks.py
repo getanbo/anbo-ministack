@@ -23,6 +23,14 @@ import time
 import urllib.parse
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    published_host_port,
+    scoped_name,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -325,7 +333,7 @@ def _collect_node_labels(cluster: dict) -> list[str]:
     return [f"--node-label={k}={v}" for k, v in labels.items()]
 
 
-def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None) -> dict:
+def _k3s_run_kwargs(name: str, port: int | None, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None) -> dict:
     """Build the docker run kwargs for a k3s server container.
 
     `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
@@ -362,8 +370,8 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
         security_opt=["seccomp=unconfined", "apparmor=unconfined"],
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
-        name=f"ministack-eks-{name}",
-        labels={"ministack": "eks", "cluster_name": name},
+        name=scoped_name(f"ministack-eks-{name}"),
+        labels=managed_labels("eks", cluster_name=name),
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
@@ -466,7 +474,12 @@ def _stop_all_k3s():
     if not client:
         return
     try:
-        for c in client.containers.list(filters={"label": "ministack=eks"}):
+        containers = (
+            owned_containers(client, "eks")
+            if isolation_enabled()
+            else client.containers.list(filters={"label": "ministack=eks"})
+        )
+        for c in containers:
             try:
                 c.stop(timeout=5)
                 c.remove(v=True, force=True)
@@ -512,11 +525,11 @@ def _create_cluster(body):
     endpoint = ""
     ca_data = ""
     container_id = None
-    port = _next_port()
+    port = None if isolation_enabled() else _next_port()
 
     # Build cluster record immediately (status CREATING) and return fast.
     # k3s startup happens in background thread to avoid blocking the event loop.
-    endpoint = f"https://{_MINISTACK_HOST}:{port}"
+    endpoint = _cluster_endpoint(port) if port is not None else ""
     cluster = {
         "name": name,
         "arn": arn,
@@ -567,13 +580,27 @@ def _create_cluster(body):
         ms_network = None
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            run_kwargs = _k3s_run_kwargs(
+                name=name,
+                port=cluster["_port"],
+                ms_network=ms_network,
+                oidc_args=oidc_args,
+                node_labels=node_labels,
+            )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             container = _start_k3s_container(client, run_kwargs, registries_yaml)
             cluster["_docker_id"] = container.id
 
-            cluster["endpoint"] = _cluster_endpoint(port)
+            if isolation_enabled():
+                assigned_port = published_host_port(container, 6443)
+                if assigned_port is None:
+                    if not isolation_enabled() or is_owned(container, "eks"):
+                        container.remove(force=True, v=True)
+                    raise RuntimeError("Docker did not report an assigned EKS host port")
+                cluster["_port"] = assigned_port
+
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
         except Exception as e:
@@ -581,7 +608,7 @@ def _create_cluster(body):
             cluster["status"] = "ACTIVE"
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             # No container came up — advertise the host-published endpoint.
-            cluster["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
+            cluster["endpoint"] = _cluster_endpoint(cluster.get("_port")) if cluster.get("_port") else ""
 
     threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})
@@ -612,6 +639,11 @@ def _delete_cluster(name):
         if client:
             try:
                 c = client.containers.get(container_id)
+                if isolation_enabled() and not is_owned(c, "eks"):
+                    logger.warning("EKS: refusing to stop unowned k3s container for %s", name)
+                    c = None
+                if c is None:
+                    raise RuntimeError("backing container is not owned by this instance")
                 c.stop(timeout=5)
                 c.remove(v=True, force=True)
                 logger.info("EKS: stopped k3s container for %s", name)
@@ -1051,18 +1083,38 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             if docker_id:
                 try:
                     container = client.containers.get(docker_id)
-                    container.stop(timeout=5)
-                    container.remove(v=True, force=True)
+                    if not isolation_enabled() or is_owned(container, "eks"):
+                        container.stop(timeout=5)
+                        container.remove(v=True, force=True)
+                    else:
+                        logger.warning(
+                            "EKS: refusing to replace unowned k3s container for %s",
+                            cluster_name,
+                        )
                 except Exception:
                     pass
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=cluster["_port"], ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            run_kwargs = _k3s_run_kwargs(
+                name=cluster_name,
+                port=None if isolation_enabled() else cluster["_port"],
+                ms_network=ms_network,
+                oidc_args=oidc_args,
+                node_labels=node_labels,
+            )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             container = _start_k3s_container(client, run_kwargs, registries_yaml)
             cluster["_docker_id"] = container.id
+
+            if isolation_enabled():
+                assigned_port = published_host_port(container, 6443)
+                if assigned_port is None:
+                    if is_owned(container, "eks"):
+                        container.remove(force=True, v=True)
+                    raise RuntimeError("Docker did not report an assigned EKS host port")
+                cluster["_port"] = assigned_port
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)

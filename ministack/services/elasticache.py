@@ -27,6 +27,14 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    published_host_port,
+    scoped_name,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -425,8 +433,11 @@ def _spawn_redis_container(name, engine, engine_version, labels):
     if not docker_client:
         return REDIS_DEFAULT_HOST, default_port, None
 
-    host_port = _port_counter[0]
-    _port_counter[0] += 1
+    scoped = isolation_enabled()
+    host_port = None
+    if not scoped:
+        host_port = _port_counter[0]
+        _port_counter[0] += 1
     endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
 
@@ -437,17 +448,20 @@ def _spawn_redis_container(name, engine, engine_version, labels):
         image = apply_image_prefix(f"memcached:{engine_version}-alpine")
         container_port = 11211
 
+    container = None
     try:
+        container_name = scoped_name(name)
         run_kwargs = dict(
             image=image, detach=True,
             ports={f"{container_port}/tcp": host_port},
-            name=name,
-            labels=labels,
+            name=container_name,
+            labels=managed_labels("elasticache", labels),
             volumes={},
         )
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
         container = docker_client.containers.run(**run_kwargs)
+        container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
@@ -455,14 +469,35 @@ def _spawn_redis_container(name, engine, engine_version, labels):
             if container_ip:
                 endpoint_host = container_ip
                 endpoint_port = container_port
-                logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
-                            engine, name, container_ip, container_port, DOCKER_NETWORK)
-            else:
-                logger.info("ElastiCache: started %s container %s on port %s", engine, name, host_port)
-        else:
+                if not scoped:
+                    logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
+                                engine, name, container_ip, container_port, DOCKER_NETWORK)
+        if scoped and endpoint_port is None:
+            endpoint_port = published_host_port(container, container_port)
+            if endpoint_port is None:
+                raise RuntimeError(
+                    f"Docker did not publish a host port for {container_port}/tcp"
+                )
+        if scoped and endpoint_host == _MINISTACK_HOST:
+            logger.info(
+                "ElastiCache: started %s container %s on port %s",
+                engine,
+                container_name,
+                endpoint_port,
+            )
+        elif scoped:
+            logger.info("ElastiCache: started %s container %s at %s:%s", engine, container_name, endpoint_host, endpoint_port)
+        elif not container_ip:
             logger.info("ElastiCache: started %s container %s on port %s", engine, name, host_port)
         return endpoint_host, endpoint_port, container.id
     except Exception as e:
+        if scoped and container is not None and is_owned(
+            container, "elasticache"
+        ):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         logger.warning("ElastiCache: Docker failed for %s: %s", name, e)
         return REDIS_DEFAULT_HOST, default_port, None
 
@@ -493,12 +528,13 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
         "--protected-mode", "no",
     ]
     try:
+        container_name = scoped_name(name)
         run_kwargs = dict(
             image=image,
             command=cmd,
             detach=True,
-            name=name,
-            labels=labels,
+            name=container_name,
+            labels=managed_labels("elasticache", labels),
             network=DOCKER_NETWORK,
         )
         container = docker_client.containers.run(**run_kwargs)
@@ -507,13 +543,14 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
         container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
         if not container_ip:
             try:
-                container.stop(timeout=2)
-                container.remove()
+                if not isolation_enabled() or is_owned(container, "elasticache"):
+                    container.stop(timeout=2)
+                    container.remove()
             except Exception:
                 pass
             logger.warning("ElastiCache: cluster node %s has no IP on network %s", name, DOCKER_NETWORK)
             return None, None, None
-        logger.info("ElastiCache: started cluster node %s at %s:%s", name, container_ip, port)
+        logger.info("ElastiCache: started cluster node %s at %s:%s", container_name, container_ip, port)
         return container_ip, port, container.id
     except Exception as e:
         logger.warning("ElastiCache: cluster node spawn failed for %s: %s", name, e)
@@ -579,6 +616,9 @@ def _teardown_containers(docker_client, container_ids):
     for cid in container_ids:
         try:
             c = docker_client.containers.get(cid)
+            if isolation_enabled() and not is_owned(c, "elasticache"):
+                logger.warning("ElastiCache: refusing to remove foreign container %s", cid)
+                continue
             c.stop(timeout=2)
             c.remove()
         except Exception as e:
@@ -938,6 +978,8 @@ def _delete_cache_cluster(p):
     if docker_client and cluster.get("_docker_container_id"):
         try:
             container = docker_client.containers.get(cluster["_docker_container_id"])
+            if isolation_enabled() and not is_owned(container, "elasticache"):
+                raise RuntimeError("refusing to remove a foreign container")
             container.stop(timeout=5)
             container.remove()
         except Exception as e:
@@ -1244,6 +1286,8 @@ def _delete_replication_group(p):
         for cid in rg.get("_docker_container_ids") or []:
             try:
                 container = docker_client.containers.get(cid)
+                if isolation_enabled() and not is_owned(container, "elasticache"):
+                    raise RuntimeError("refusing to remove a foreign container")
                 container.stop(timeout=5)
                 container.remove()
             except Exception as e:
@@ -2368,23 +2412,31 @@ def _error(code, message, status):
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for cluster in _clusters.all_values():
-            cid = cluster.get("_docker_container_id")
-            if cid:
+        if isolation_enabled():
+            for c in owned_containers(docker_client, "elasticache", all=True):
                 try:
-                    c = docker_client.containers.get(cid)
                     c.stop(timeout=2)
                     c.remove(v=True)
                 except Exception as e:
-                    logger.warning("reset: failed to stop/remove container %s: %s", cid, e)
-        for rg in _replication_groups.all_values():
-            for cid in rg.get("_docker_container_ids") or []:
-                try:
-                    c = docker_client.containers.get(cid)
-                    c.stop(timeout=2)
-                    c.remove(v=True)
-                except Exception as e:
-                    logger.warning("reset: failed to stop/remove RG container %s: %s", cid, e)
+                    logger.warning("reset: failed to stop/remove owned container %s: %s", c.id, e)
+        else:
+            for cluster in _clusters.all_values():
+                cid = cluster.get("_docker_container_id")
+                if cid:
+                    try:
+                        c = docker_client.containers.get(cid)
+                        c.stop(timeout=2)
+                        c.remove(v=True)
+                    except Exception as e:
+                        logger.warning("reset: failed to stop/remove container %s: %s", cid, e)
+            for rg in _replication_groups.all_values():
+                for cid in rg.get("_docker_container_ids") or []:
+                    try:
+                        c = docker_client.containers.get(cid)
+                        c.stop(timeout=2)
+                        c.remove(v=True)
+                    except Exception as e:
+                        logger.warning("reset: failed to stop/remove RG container %s: %s", cid, e)
     _clusters.clear()
     _replication_groups.clear()
     _subnet_groups.clear()

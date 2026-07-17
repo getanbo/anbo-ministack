@@ -49,6 +49,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import is_owned, isolation_enabled, managed_labels, scoped_name
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
@@ -2589,7 +2590,9 @@ def _is_container_running(container) -> bool:
 def _kill_pool_entry(entry: dict) -> None:
     """Stop + remove the container, clean its tmpdir."""
     container = entry.get("container")
-    if container is not None:
+    if container is not None and (
+        not isolation_enabled() or is_owned(container, "lambda")
+    ):
         try:
             container.stop(timeout=2)
         except Exception:
@@ -3371,7 +3374,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
-        "labels": {"ministack": "lambda"},
+        "labels": managed_labels("lambda"),
     }
     if package_type == "Image":
         # User image brings its own entrypoint. ImageConfig can override.
@@ -3400,6 +3403,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         if df_mounts:
             run_kwargs.setdefault("mounts", []).extend(df_mounts)
         run_kwargs.update(df_kwargs)
+
+    # Scoped names and labels are applied after optional Docker flags so an
+    # instance cannot accidentally lose the ownership contract.
+    if isolation_enabled():
+        run_kwargs["name"] = scoped_name(
+            f"ministack-lambda-{config['FunctionName']}-{new_uuid()[:12]}"
+        )
+        run_kwargs["labels"] = managed_labels("lambda", run_kwargs.get("labels"))
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:

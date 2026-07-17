@@ -25,6 +25,13 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    owned_containers,
+    scoped_name,
+)
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1424,14 +1431,31 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
     glue_version = job.get("GlueVersion", "4.0")
     image = _glue_image_for_version(glue_version)
-    container_name = f"ministack-glue-{job_name}-{run['Id'][:8]}"
+    container_name = scoped_name(
+        f"ministack-glue-{job_name}-{run['Id'][:8]}"
+    )
 
-    # Remove stale container with same name
-    try:
-        existing = docker_client.containers.get(container_name)
-        existing.remove(force=True)
-    except Exception:
-        pass
+    # Remove stale container with same name. Preserve upstream's best-effort
+    # legacy behavior; scoped mode fails closed on ambiguous ownership.
+    if isolation_enabled():
+        try:
+            existing = docker_client.containers.get(container_name)
+        except Exception:
+            existing = None
+        if existing is not None:
+            if not is_owned(existing, "glue"):
+                run["JobRunState"] = "FAILED"
+                run["ErrorMessage"] = (
+                    f"refusing to replace foreign container {container_name}"
+                )
+                return
+            existing.remove(force=True)
+    else:
+        try:
+            existing = docker_client.containers.get(container_name)
+            existing.remove(force=True)
+        except Exception:
+            pass
 
     ms_network = _get_ministack_network(docker_client)
 
@@ -1512,7 +1536,13 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "command": cmd,
         "environment": container_env,
         "detach": True,
-        "labels": {"ministack": "glue", "job_name": job_name},
+        "labels": managed_labels(
+            "glue",
+            {
+                "ministack": "glue",
+                "job_name": job_name,
+            },
+        ),
     }
 
     if ms_network:
@@ -1523,6 +1553,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         job_name, image, ms_network or "host",
     )
 
+    container = None
     try:
         container = docker_client.containers.create(**container_kwargs)
         # Copy script into container (avoids Docker-in-Docker volume mount issues)
@@ -1542,7 +1573,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["JobRunState"] = "FAILED"
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
-            container.remove(force=True)
+            if container is not None and (
+                not isolation_enabled() or is_owned(container, "glue")
+            ):
+                container.remove(force=True)
         except Exception:
             pass
         return
@@ -1566,7 +1600,8 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
         try:
-            container.remove(force=True)
+            if not isolation_enabled() or is_owned(container, "glue"):
+                container.remove(force=True)
         except Exception:
             pass
 
@@ -2058,6 +2093,14 @@ def _simple_glob_match(pattern, name):
 
 
 def reset():
+    docker_client = _get_docker() if isolation_enabled() else None
+    if docker_client:
+        for container in owned_containers(docker_client, "glue", all=True):
+            try:
+                container.stop(timeout=2)
+                container.remove(force=True)
+            except Exception:
+                pass
     _databases.clear()
     _tables.clear()
     _partitions.clear()
