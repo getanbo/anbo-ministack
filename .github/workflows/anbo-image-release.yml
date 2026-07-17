@@ -187,7 +187,17 @@ jobs:
           npm install --global npm@11.6.2
           npm ci
           node plugins/ministack/scripts/run-installed-cli-isolation.mjs \
-            --ministack-image "${MINISTACK_IMAGE}"
+            --ministack-image "${MINISTACK_IMAGE}" \
+            --diagnostics-root "${GITHUB_WORKSPACE}/acceptance-diagnostics"
+
+      - name: Upload acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-acceptance-diagnostics-${{ steps.release.outputs.version }}-${{ github.run_attempt }}
+          path: acceptance-diagnostics
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Promote exact candidate indexes without rebuilding
         env:
