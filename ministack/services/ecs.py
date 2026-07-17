@@ -37,7 +37,9 @@ from ministack.core.docker_scope import (
     isolation_enabled,
     managed_labels,
     owned_containers,
+    published_host_port,
     scoped_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -1021,6 +1023,26 @@ def _docker_host_mode(td):
     return td.get("networkMode") == "host" and not isolation_enabled()
 
 
+def _docker_network_bindings(container, cdef):
+    """Expose scoped Docker-assigned ports through the ECS task response."""
+    if not isolation_enabled():
+        return []
+
+    bindings = []
+    for mapping in cdef.get("portMappings", []):
+        container_port = mapping["containerPort"]
+        host_port = published_host_port(container, container_port)
+        if host_port is None:
+            continue
+        bindings.append({
+            "bindIP": "0.0.0.0",
+            "containerPort": container_port,
+            "hostPort": host_port,
+            "protocol": mapping.get("protocol", "tcp"),
+        })
+    return bindings
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -1264,12 +1286,18 @@ def _run_task(data):
                 )
 
                 try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    container = docker_client.containers.run(
+                        cdef["image"],
+                        **validated_launch_kwargs("ecs", run_kwargs),
+                    )
                     task["_docker_ids"].append(container.id)
                     ecs_metadata.set_docker_id(metadata_token, container.id)
                     task.setdefault("_metadata_tokens", []).append(metadata_token)
                     if i < len(task["containers"]):
                         task["containers"][i]["runtimeId"] = container.id[:12]
+                        task["containers"][i]["networkBindings"] = (
+                            _docker_network_bindings(container, cdef)
+                        )
                     logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
                 except Exception as e:
                     ecs_metadata.unregister_token(metadata_token)

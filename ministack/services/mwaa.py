@@ -30,6 +30,7 @@ from ministack.core.docker_scope import (
     published_host_port,
     scoped_name,
     scoped_volume_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -370,7 +371,9 @@ def _start_airflow_container(env_name, env):
                 },
             }
 
-        container = docker_client.containers.run(**container_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("mwaa", container_kwargs)
+        )
         env["_docker_container_id"] = container.id
 
         internal_host = "localhost"
@@ -725,7 +728,19 @@ def reset():
     """Stop all containers and clear state."""
     docker_client = _get_docker()
     if docker_client and isolation_enabled():
-        for container in owned_containers(docker_client, "mwaa", all=True):
+        try:
+            containers = owned_containers(
+                docker_client,
+                "mwaa",
+                all=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "reset: failed to list owned MWAA containers: %s",
+                e,
+            )
+            containers = []
+        for container in containers:
             try:
                 container.stop(timeout=5)
                 container.remove(force=True)

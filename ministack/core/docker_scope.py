@@ -110,6 +110,55 @@ def managed_labels(
     return labels
 
 
+def validated_launch_kwargs(service: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Fail closed before launching a scoped Docker child.
+
+    Legacy mode returns the original dictionary without inspecting or copying
+    it. Scoped mode requires the name and reserved labels produced by this
+    module for the current instance and reviewed service.
+    """
+    value = instance_id()
+    if value is None:
+        return kwargs
+
+    service = _validate_service(service)
+    if not isinstance(kwargs, dict):
+        raise TypeError("Docker launch kwargs must be a dictionary")
+
+    scope = instance_scope()
+    name = kwargs.get("name")
+    expected_name_prefix = f"ministack-{scope}-"
+    if not isinstance(name, str) or not name.startswith(expected_name_prefix):
+        raise ValueError(
+            f"Scoped Docker launch for {service!r} must use scoped_name()"
+        )
+
+    labels = kwargs.get("labels")
+    if not isinstance(labels, Mapping):
+        raise ValueError(
+            f"Scoped Docker launch for {service!r} must use managed_labels()"
+        )
+
+    required_labels = {
+        "ministack": service,
+        _MANAGED_LABEL: "true",
+        _INSTANCE_LABEL: value,
+        _SCOPE_LABEL: scope,
+        _SERVICE_LABEL: service,
+    }
+    invalid_labels = {
+        key: expected
+        for key, expected in required_labels.items()
+        if labels.get(key) != expected
+    }
+    if invalid_labels:
+        raise ValueError(
+            f"Scoped Docker launch for {service!r} has invalid ownership labels"
+        )
+
+    return kwargs
+
+
 def _safe_scoped_name(legacy_name: str, max_length: int) -> str:
     if not isinstance(legacy_name, str) or not legacy_name:
         raise ValueError("Docker resource name must be a non-empty string")

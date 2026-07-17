@@ -39,6 +39,7 @@ def _clear_isolation(monkeypatch):
 
 def test_legacy_helpers_are_exact_pass_through(monkeypatch):
     _clear_isolation(monkeypatch)
+    launch_kwargs = {"labels": object()}
 
     assert docker_scope.instance_id() is None
     assert docker_scope.instance_scope() is None
@@ -50,6 +51,10 @@ def test_legacy_helpers_are_exact_pass_through(monkeypatch):
         "db_id": "orders",
         "region": "us-east-1",
     }
+    assert (
+        docker_scope.validated_launch_kwargs("not-a-managed-service", launch_kwargs)
+        is launch_kwargs
+    )
     assert docker_scope.contract_metadata() is None
 
 
@@ -131,6 +136,53 @@ def test_managed_labels_add_reserved_ownership_fields(monkeypatch):
         "com.ministack.scope": docker_scope.instance_scope(),
         "com.ministack.service": "lambda",
     }
+
+
+def test_launch_guard_accepts_current_instance_ownership(monkeypatch):
+    monkeypatch.setenv(docker_scope.INSTANCE_ID_ENV, "sandbox-a")
+    kwargs = {
+        "name": docker_scope.scoped_name("ministack-lambda-notes"),
+        "labels": docker_scope.managed_labels("lambda", function_name="notes"),
+    }
+
+    assert docker_scope.validated_launch_kwargs("lambda", kwargs) is kwargs
+
+
+@pytest.mark.parametrize(
+    ("service", "name", "labels", "match"),
+    [
+        (
+            "lambda",
+            "ministack-lambda-notes",
+            lambda: docker_scope.managed_labels("lambda"),
+            "scoped_name",
+        ),
+        (
+            "lambda",
+            lambda: docker_scope.scoped_name("ministack-lambda-notes"),
+            None,
+            "managed_labels",
+        ),
+        (
+            "lambda",
+            lambda: docker_scope.scoped_name("ministack-lambda-notes"),
+            lambda: docker_scope.managed_labels("ecs"),
+            "ownership labels",
+        ),
+    ],
+)
+def test_launch_guard_rejects_unowned_scoped_kwargs(
+    monkeypatch, service, name, labels, match
+):
+    monkeypatch.setenv(docker_scope.INSTANCE_ID_ENV, "sandbox-a")
+    resolved_name = name() if callable(name) else name
+    resolved_labels = labels() if callable(labels) else labels
+
+    with pytest.raises(ValueError, match=match):
+        docker_scope.validated_launch_kwargs(
+            service,
+            {"name": resolved_name, "labels": resolved_labels},
+        )
 
 
 def test_owned_containers_filters_and_verifies_daemon_results(monkeypatch):

@@ -30,6 +30,7 @@ from ministack.core.docker_scope import (
     owned_containers,
     published_host_port,
     scoped_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -442,18 +443,24 @@ def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None
     must exist before the entrypoint runs: create the container stopped,
     upload the file with put_archive, then start it."""
     if not registries_yaml:
-        return client.containers.run(**run_kwargs)
+        return client.containers.run(
+            **validated_launch_kwargs("eks", run_kwargs)
+        )
     import io
     import tarfile
 
     create_kwargs = dict(run_kwargs)
     create_kwargs.pop("detach", None)  # run()-only kwarg
     try:
-        container = client.containers.create(**create_kwargs)
+        container = client.containers.create(
+            **validated_launch_kwargs("eks", create_kwargs)
+        )
     except Exception:
         # create() does not auto-pull missing images the way run() does.
         client.images.pull(create_kwargs["image"])
-        container = client.containers.create(**create_kwargs)
+        container = client.containers.create(
+            **validated_launch_kwargs("eks", create_kwargs)
+        )
     try:
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -464,7 +471,16 @@ def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None
         container.put_archive("/", buf.getvalue())
     except Exception as e:
         logger.warning("EKS: could not inject ECR registries.yaml: %s", e)
-    container.start()
+    try:
+        container.start()
+    except Exception:
+        if isolation_enabled():
+            try:
+                if is_owned(container, "eks"):
+                    container.remove(force=True, v=True)
+            except Exception:
+                pass
+        raise
     return container
 
 

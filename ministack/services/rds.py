@@ -52,6 +52,7 @@ from ministack.core.docker_scope import (
     published_host_port,
     scoped_name,
     scoped_volume_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -406,7 +407,9 @@ def _start_rds_container_for_instance(db_id, instance):
         }
 
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("rds", container_kwargs)
+        )
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
@@ -1107,6 +1110,18 @@ def _create_db_instance(p):
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
     storage_type = _p(p, "StorageType") or "gp2"
     subnet_group_name = _p(p, "DBSubnetGroupName") or "default"
+    explicit_pg = _p(p, "DBParameterGroupName")
+    if (
+        isolation_enabled()
+        and explicit_pg
+        and not explicit_pg.startswith("default.")
+        and explicit_pg not in _param_groups
+    ):
+        return _error(
+            "DBParameterGroupNotFound",
+            f"DBParameterGroup {explicit_pg} not found.",
+            404,
+        )
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
@@ -1163,7 +1178,9 @@ def _create_db_instance(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
-                container = docker_client.containers.run(**container_kwargs)
+                container = docker_client.containers.run(
+                    **validated_launch_kwargs("rds", container_kwargs)
+                )
                 if isolation_enabled():
                     host_port = published_host_port(container, container_port)
                     if host_port is None:
@@ -1202,7 +1219,6 @@ def _create_db_instance(p):
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
     cluster_id = cluster_id_param
-    explicit_pg = _p(p, "DBParameterGroupName")
     # AWS rejects a reference to a parameter group that doesn't exist. Validate
     # custom names against the store; AWS-managed `default.*` groups are implicit
     # and not tracked here, so they're accepted as-is.

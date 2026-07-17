@@ -34,6 +34,7 @@ from ministack.core.docker_scope import (
     owned_containers,
     published_host_port,
     scoped_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -460,7 +461,9 @@ def _spawn_redis_container(name, engine, engine_version, labels):
         )
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
-        container = docker_client.containers.run(**run_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("elasticache", run_kwargs)
+        )
         container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
@@ -527,6 +530,7 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
         "--appendonly", "no",
         "--protected-mode", "no",
     ]
+    container = None
     try:
         container_name = scoped_name(name)
         run_kwargs = dict(
@@ -537,7 +541,9 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
             labels=managed_labels("elasticache", labels),
             network=DOCKER_NETWORK,
         )
-        container = docker_client.containers.run(**run_kwargs)
+        container = docker_client.containers.run(
+            **validated_launch_kwargs("elasticache", run_kwargs)
+        )
         container.reload()
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
@@ -553,6 +559,15 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
         logger.info("ElastiCache: started cluster node %s at %s:%s", container_name, container_ip, port)
         return container_ip, port, container.id
     except Exception as e:
+        if (
+            isolation_enabled()
+            and container is not None
+            and is_owned(container, "elasticache")
+        ):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         logger.warning("ElastiCache: cluster node spawn failed for %s: %s", name, e)
         return None, None, None
 
@@ -2413,7 +2428,19 @@ def reset():
     docker_client = _get_docker()
     if docker_client:
         if isolation_enabled():
-            for c in owned_containers(docker_client, "elasticache", all=True):
+            try:
+                containers = owned_containers(
+                    docker_client,
+                    "elasticache",
+                    all=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    "reset: failed to list owned ElastiCache containers: %s",
+                    e,
+                )
+                containers = []
+            for c in containers:
                 try:
                     c.stop(timeout=2)
                     c.remove(v=True)

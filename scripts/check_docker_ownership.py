@@ -20,8 +20,15 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / ".github" / "downstream-docker-ownership.json"
 DOCKER_SCOPE_MODULE = "ministack.core.docker_scope"
 LAUNCH_METHODS = frozenset({"create", "run"})
+LAUNCH_GUARD = "validated_launch_kwargs"
 MANDATORY_HELPERS = frozenset(
-    {"is_owned", "isolation_enabled", "managed_labels", "scoped_name"}
+    {
+        "is_owned",
+        "isolation_enabled",
+        "managed_labels",
+        "scoped_name",
+        LAUNCH_GUARD,
+    }
 )
 
 
@@ -51,6 +58,36 @@ def _docker_scope_imports(tree: ast.AST) -> tuple[dict[str, str], set[str]]:
     return direct, modules
 
 
+def _scope_helper(
+    call: ast.Call,
+    direct: dict[str, str],
+    modules: set[str],
+) -> str | None:
+    """Return the canonical docker_scope helper called by ``call``."""
+    if isinstance(call.func, ast.Name):
+        return direct.get(call.func.id)
+    if (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in modules
+    ):
+        return call.func.attr
+    return None
+
+
+def _service_argument(call: ast.Call) -> str | None:
+    """Return a helper call's literal service argument."""
+    service_arg: ast.AST | None = call.args[0] if call.args else None
+    if service_arg is None:
+        service_arg = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "service"),
+            None,
+        )
+    if isinstance(service_arg, ast.Constant) and isinstance(service_arg.value, str):
+        return service_arg.value
+    return None
+
+
 def _called_scope_helpers(
     tree: ast.AST,
     direct: dict[str, str],
@@ -63,29 +100,16 @@ def _called_scope_helpers(
         if not isinstance(node, ast.Call):
             continue
 
-        helper = None
-        if isinstance(node.func, ast.Name):
-            helper = direct.get(node.func.id)
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in modules
-        ):
-            helper = node.func.attr
+        helper = _scope_helper(node, direct, modules)
         if helper is None:
             continue
 
         helpers.add(helper)
         if helper != "managed_labels":
             continue
-        service_arg: ast.AST | None = node.args[0] if node.args else None
-        if service_arg is None:
-            service_arg = next(
-                (keyword.value for keyword in node.keywords if keyword.arg == "service"),
-                None,
-            )
-        if isinstance(service_arg, ast.Constant) and isinstance(service_arg.value, str):
-            managed_services.add(service_arg.value)
+        service = _service_argument(node)
+        if service is not None:
+            managed_services.add(service)
     return helpers, managed_services
 
 
@@ -129,7 +153,10 @@ def check_repository(root: Path = ROOT) -> list[str]:
     if not isinstance(configured_modules, dict):
         configured_modules = {}
 
-    discovered: dict[str, tuple[Path, ast.Module, list[tuple[int, str]]]] = {}
+    discovered: dict[
+        str,
+        tuple[Path, ast.Module, list[tuple[ast.Call, str]]],
+    ] = {}
     for path in sorted(services_path.glob("*.py")):
         try:
             tree = ast.parse(path.read_text(), filename=str(path))
@@ -138,7 +165,7 @@ def check_repository(root: Path = ROOT) -> list[str]:
             continue
 
         launches = [
-            (node.lineno, method)
+            (node, method)
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             for method in [_launch_method(node)]
@@ -150,7 +177,9 @@ def check_repository(root: Path = ROOT) -> list[str]:
     new_modules = sorted(set(discovered) - set(configured_modules))
     for module in new_modules:
         path, _, launches = discovered[module]
-        locations = ", ".join(f"{method}:{line}" for line, method in launches)
+        locations = ", ".join(
+            f"{method}:{call.lineno}" for call, method in launches
+        )
         errors.append(
             f"{path.relative_to(root)} launches Docker children ({locations}) but is not reviewed in "
             f"{policy_path.relative_to(root)}"
@@ -187,7 +216,9 @@ def check_repository(root: Path = ROOT) -> list[str]:
                 )
             elif actual_counts[method] != expected:
                 locations = ", ".join(
-                    str(line) for line, launch_method in launches if launch_method == method
+                    str(call.lineno)
+                    for call, launch_method in launches
+                    if launch_method == method
                 ) or "none"
                 errors.append(
                     f"{path.relative_to(root)} has {actual_counts[method]} containers.{method} calls "
@@ -212,19 +243,53 @@ def check_repository(root: Path = ROOT) -> list[str]:
                 f"{', '.join(unexpected_services)}"
             )
 
-        for line, method in launches:
-            call = next(
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call)
-                and node.lineno == line
-                and _launch_method(node) == method
-            )
-            keyword_names = {keyword.arg for keyword in call.keywords}
-            if None not in keyword_names and not {"labels", "name"}.issubset(keyword_names):
+        for call, method in launches:
+            line = call.lineno
+            expansions = [
+                keyword.value for keyword in call.keywords if keyword.arg is None
+            ]
+            if len(expansions) != 1:
                 errors.append(
-                    f"{path.relative_to(root)}:{line} containers.{method} must receive name and labels "
-                    "or expand reviewed scoped kwargs"
+                    f"{path.relative_to(root)}:{line} containers.{method} must directly "
+                    f"expand exactly one {LAUNCH_GUARD}({expected_service!r}, ...) call"
+                )
+                continue
+
+            guard_call = expansions[0]
+            if (
+                not isinstance(guard_call, ast.Call)
+                or _scope_helper(guard_call, direct, module_aliases) != LAUNCH_GUARD
+            ):
+                errors.append(
+                    f"{path.relative_to(root)}:{line} containers.{method} must directly "
+                    f"expand {LAUNCH_GUARD}({expected_service!r}, ...)"
+                )
+                continue
+
+            actual_service = _service_argument(guard_call)
+            if actual_service != expected_service:
+                rendered_service = (
+                    repr(actual_service)
+                    if actual_service is not None
+                    else "a literal service"
+                )
+                errors.append(
+                    f"{path.relative_to(root)}:{line} {LAUNCH_GUARD} must use "
+                    f"{expected_service!r}, not {rendered_service}"
+                )
+
+            kwargs_arg = guard_call.args[1] if len(guard_call.args) > 1 else next(
+                (
+                    keyword.value
+                    for keyword in guard_call.keywords
+                    if keyword.arg == "kwargs"
+                ),
+                None,
+            )
+            if kwargs_arg is None:
+                errors.append(
+                    f"{path.relative_to(root)}:{line} {LAUNCH_GUARD} must receive "
+                    "the Docker launch kwargs"
                 )
 
     return errors

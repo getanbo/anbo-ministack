@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from ministack.core.docker_scope import managed_labels
 from ministack.services import ecs
 
@@ -28,6 +30,19 @@ def test_scoped_ecs_task_child_has_owned_name_labels_and_dynamic_port(monkeypatc
             "com.amazonaws.ecs.task-definition-version": "2",
         },
     )
+    container = SimpleNamespace(
+        reload=lambda: None,
+        ports={"8080/tcp": [{"HostPort": "49152"}]},
+    )
+    assert ecs._docker_network_bindings(
+        container,
+        {"portMappings": [{"containerPort": 8080, "hostPort": 8080}]},
+    ) == [{
+        "bindIP": "0.0.0.0",
+        "containerPort": 8080,
+        "hostPort": 49152,
+        "protocol": "tcp",
+    }]
 
 
 def test_legacy_ecs_task_child_contract_is_unchanged(monkeypatch):
@@ -54,3 +69,7 @@ def test_legacy_ecs_task_child_contract_is_unchanged(monkeypatch):
         "com.amazonaws.ecs.task-definition-family": "notes",
         "com.amazonaws.ecs.task-definition-version": "2",
     }
+    assert ecs._docker_network_bindings(
+        SimpleNamespace(),
+        {"portMappings": [{"containerPort": 8080, "hostPort": 8181}]},
+    ) == []

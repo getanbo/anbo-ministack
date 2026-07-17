@@ -49,7 +49,13 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.docker_scope import is_owned, isolation_enabled, managed_labels, scoped_name
+from ministack.core.docker_scope import (
+    is_owned,
+    isolation_enabled,
+    managed_labels,
+    scoped_name,
+    validated_launch_kwargs,
+)
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
@@ -3425,11 +3431,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
                 shutil.rmtree(tmpdir, ignore_errors=True)
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
+    container = None
     try:
         if _use_docker_cp or _cp_layers:
             create_kwargs = {k: v for k, v in run_kwargs.items()
                              if k not in ("detach", "stdin_open")}
-            container = client.containers.create(**create_kwargs)
+            container = client.containers.create(
+                **validated_launch_kwargs("lambda", create_kwargs)
+            )
             # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
             if _use_docker_cp:
                 _docker_cp_dir(container, code_dir, "/var/task")
@@ -3445,8 +3454,19 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
                 _docker_cp_dir(container, ld, "/opt", arcname=".")
             container.start()
         else:
-            container = client.containers.run(**run_kwargs)
+            container = client.containers.run(
+                **validated_launch_kwargs("lambda", run_kwargs)
+            )
     except Exception:
+        if (
+            isolation_enabled()
+            and container is not None
+            and is_owned(container, "lambda")
+        ):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         if tmpdir and os.path.exists(tmpdir):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)

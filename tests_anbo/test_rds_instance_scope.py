@@ -63,6 +63,25 @@ def test_scoped_rds_child_uses_dynamic_port_and_owned_resources(monkeypatch):
     assert instance["Endpoint"] == {"Address": rds._MINISTACK_HOST, "Port": 49200}
 
 
+def test_scoped_invalid_parameter_group_does_not_launch_docker(monkeypatch):
+    docker = _Docker()
+    monkeypatch.setenv("MINISTACK_INSTANCE_ID", "sandbox-a")
+    monkeypatch.setattr(rds, "_get_docker", lambda: docker)
+    monkeypatch.setattr(rds, "_get_ministack_network", lambda _client: None)
+
+    status, _, body = rds._create_db_instance(
+        {
+            "DBInstanceIdentifier": ["invalid-param-group-notes"],
+            "Engine": ["postgres"],
+            "DBParameterGroupName": ["missing-scoped-param-group"],
+        }
+    )
+
+    assert status == 404
+    assert b"DBParameterGroupNotFound" in body
+    assert docker.containers.created == []
+
+
 def test_legacy_rds_names_remain_unchanged(monkeypatch):
     monkeypatch.delenv("MINISTACK_INSTANCE_ID", raising=False)
 

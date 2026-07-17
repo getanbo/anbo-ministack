@@ -31,6 +31,7 @@ from ministack.core.docker_scope import (
     managed_labels,
     owned_containers,
     scoped_name,
+    validated_launch_kwargs,
 )
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -1555,7 +1556,9 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
 
     container = None
     try:
-        container = docker_client.containers.create(**container_kwargs)
+        container = docker_client.containers.create(
+            **validated_launch_kwargs("glue", container_kwargs)
+        )
         # Copy script into container (avoids Docker-in-Docker volume mount issues)
         import io
         import tarfile
@@ -2095,7 +2098,19 @@ def _simple_glob_match(pattern, name):
 def reset():
     docker_client = _get_docker() if isolation_enabled() else None
     if docker_client:
-        for container in owned_containers(docker_client, "glue", all=True):
+        try:
+            containers = owned_containers(
+                docker_client,
+                "glue",
+                all=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "reset: failed to list owned Glue containers: %s",
+                e,
+            )
+            containers = []
+        for container in containers:
             try:
                 container.stop(timeout=2)
                 container.remove(force=True)

@@ -34,6 +34,7 @@ from ministack.core.docker_scope import (
     owned_containers,
     published_host_port,
     scoped_name,
+    validated_launch_kwargs,
 )
 from ministack.core.responses import (
     AccountScopedDict,
@@ -292,7 +293,9 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
     container = None
     endpoint_host, endpoint_port = _MINISTACK_HOST, host_port
     try:
-        container = docker.containers.run(**run_kwargs)
+        container = docker.containers.run(
+            **validated_launch_kwargs("opensearch", run_kwargs)
+        )
         cid = container.id
         if DOCKER_NETWORK:
             container.reload()
@@ -337,7 +340,9 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             )
             if DOCKER_NETWORK:
                 dash_kwargs["network"] = DOCKER_NETWORK
-            dash_container = docker.containers.run(**dash_kwargs)
+            dash_container = docker.containers.run(
+                **validated_launch_kwargs("opensearch", dash_kwargs)
+            )
             dash_cid = dash_container.id
             dash_endpoint_host = _MINISTACK_HOST
             if scoped and DOCKER_NETWORK:

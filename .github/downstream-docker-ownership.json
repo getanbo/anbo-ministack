@@ -4,7 +4,8 @@
     "is_owned",
     "isolation_enabled",
     "managed_labels",
-    "scoped_name"
+    "scoped_name",
+    "validated_launch_kwargs"
   ],
   "modules": {
     "ecs": {
